@@ -12,7 +12,7 @@ from pathlib import Path
 from utils import validate_video_path, logger, cleanup_files
 from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
-from src.transcribe import transcribe_audio, translate_segments, correct_translations
+from src.transcribe import transcribe_audio, transcribe_audio_translate, translate_segments, correct_translations
 from src.merge_srt import save_subtitles, save_japanese_srt, load_japanese_srt
 from config import ENABLE_CORRECTION
 
@@ -63,6 +63,12 @@ Examples:
         help="Force re-transcription even if cached Japanese subtitles exist"
     )
 
+    parser.add_argument(
+        "--direct-whisper",
+        action="store_true",
+        help="Use Whisper's direct translation to English (faster, cheaper, but lower quality than GPT-4 translation)"
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -82,12 +88,23 @@ Examples:
         elif args.no_correction:
             enable_correction = False
 
-        # Determine total steps (combined chunking+transcription into one step)
-        total_steps = 4 if enable_correction else 3
+        # Direct whisper mode is incompatible with correction (already translated)
+        if args.direct_whisper and enable_correction:
+            logger.warning("--direct-whisper is incompatible with correction. Disabling correction.")
+            enable_correction = False
+
+        # Determine total steps
+        if args.direct_whisper:
+            # Direct whisper: extract + translate = 2 steps
+            total_steps = 2
+        else:
+            # Normal mode: extract + transcribe + translate (+ optional correction)
+            total_steps = 4 if enable_correction else 3
 
         # Check for cached Japanese subtitles (skip transcription if found)
+        # Skip cache entirely when using direct whisper (no Japanese intermediate)
         segments = None
-        if not args.force_transcribe:
+        if not args.force_transcribe and not args.direct_whisper:
             segments = load_japanese_srt(video_path)
 
         if segments:
@@ -98,10 +115,17 @@ Examples:
             logger.info(f"\n[1/{total_steps}] Extracting audio...")
             audio_path = extract_audio(video_path)
 
-            # Step 2: Concurrent chunking and transcription
-            logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio (concurrent processing)...")
-            chunks_generator = chunk_audio(audio_path)
-            segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
+            # Step 2: Concurrent chunking and transcription/translation
+            if args.direct_whisper:
+                # Direct Whisper translation (no GPT-4 needed)
+                logger.info(f"\n[2/{total_steps}] Chunking and translating to English with Whisper (concurrent processing)...")
+                chunks_generator = chunk_audio(audio_path)
+                segments, chunks_info = transcribe_audio_translate(chunks_generator, workers=args.workers)
+            else:
+                # Normal mode: Transcribe to Japanese first
+                logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio (concurrent processing)...")
+                chunks_generator = chunk_audio(audio_path)
+                segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
 
             # Clean up chunk files
             cleanup_chunks(chunks_info)
@@ -111,18 +135,20 @@ Examples:
                 logger.error("No transcription segments were generated. Cannot create subtitle file.")
                 sys.exit(1)
 
-            # Save Japanese subtitles for future use
-            save_japanese_srt(segments, video_path)
+            # Save Japanese subtitles for future use (only in normal mode)
+            if not args.direct_whisper:
+                save_japanese_srt(segments, video_path)
 
             # Clean up extracted audio file
             cleanup_files(audio_path)
 
-        # Step 3: Translate to English using GPT-4
-        logger.info(f"\n[3/{total_steps}] Translating to English with GPT-4...")
-        segments = translate_segments(segments)  # Uses TRANSLATION_WORKERS from config
+        # Step 3: Translate to English using GPT-4 (skip if using direct Whisper)
+        if not args.direct_whisper:
+            logger.info(f"\n[3/{total_steps}] Translating to English with GPT-4...")
+            segments = translate_segments(segments)  # Uses TRANSLATION_WORKERS from config
 
-        # Step 4 (optional): Correct translations
-        if enable_correction:
+        # Step 4 (optional): Correct translations (only in normal mode)
+        if enable_correction and not args.direct_whisper:
             logger.info(f"\n[4/{total_steps}] Correcting translations with GPT-4...")
             segments = correct_translations(segments)
 

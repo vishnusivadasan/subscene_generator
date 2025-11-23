@@ -81,6 +81,75 @@ def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
     return []
 
 
+def process_chunk_translate(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
+    """
+    Process a single audio chunk with Whisper API using direct translation to English.
+    Includes retry logic with exponential backoff.
+
+    Args:
+        chunk_info: Dictionary with chunk_path and offset_seconds
+
+    Returns:
+        List of translated segments (in English) with adjusted timestamps
+    """
+    chunk_path = chunk_info["chunk_path"]
+    offset_seconds = chunk_info["offset_seconds"]
+
+    max_retries = 3
+    backoff_times = [1, 2, 4]  # Exponential backoff: 1s, 2s, 4s
+
+    for attempt in range(max_retries):
+        try:
+            # Open audio file and send to Whisper API for direct translation to English
+            with open(chunk_path, "rb") as audio_file:
+                response = client.audio.translations.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json"
+                )
+
+            # Extract segments from response
+            segments = []
+            if hasattr(response, 'segments') and response.segments:
+                for seg in response.segments:
+                    # Adjust timestamps by chunk offset
+                    segments.append({
+                        "start": seg.start + offset_seconds,
+                        "end": seg.end + offset_seconds,
+                        "text": seg.text.strip()
+                    })
+
+            return segments
+
+        except Exception as e:
+            error_message = str(e)
+
+            # Check if it's a rate limit error (429)
+            is_rate_limit = "429" in error_message or "rate_limit" in error_message.lower()
+
+            if attempt < max_retries - 1:
+                # Calculate backoff time
+                backoff = backoff_times[attempt]
+
+                if is_rate_limit:
+                    logger.warning(f"[Worker] Retry #{attempt + 1} after rate limit")
+                else:
+                    logger.warning(
+                        f"[Worker] Retry #{attempt + 1} after error: {error_message}"
+                    )
+
+                time.sleep(backoff)
+            else:
+                # Final failure after all retries
+                logger.error(
+                    f"[ERROR] Failed chunk at offset {offset_seconds:.2f}s "
+                    f"after {max_retries} attempts: {error_message}"
+                )
+                return []
+
+    return []
+
+
 def transcribe_audio(chunks_generator, total_chunks: int = None, workers: int = None) -> List[Dict[str, any]]:
     """
     Transcribe audio chunks in parallel using ThreadPoolExecutor.
@@ -140,6 +209,69 @@ def transcribe_audio(chunks_generator, total_chunks: int = None, workers: int = 
     all_segments.sort(key=lambda x: x["start"])
 
     logger.info(f"Transcription complete. Total segments: {len(all_segments)}")
+
+    return all_segments, chunks_info
+
+
+def transcribe_audio_translate(chunks_generator, total_chunks: int = None, workers: int = None) -> List[Dict[str, any]]:
+    """
+    Transcribe and translate audio chunks directly to English in parallel using ThreadPoolExecutor.
+    Uses Whisper's built-in translation feature instead of GPT-4.
+
+    Args:
+        chunks_generator: Generator that yields chunk information dictionaries
+        total_chunks: Total number of chunks for progress tracking (optional)
+        workers: Number of parallel workers (overrides config if provided)
+
+    Returns:
+        List of all translated segments (in English) sorted by start time
+    """
+    # Determine worker count
+    if workers is None:
+        workers = WORKERS
+
+    logger.info(f"Starting concurrent chunking and translation with {workers} workers (direct Whisper translation)")
+
+    all_segments = []
+    chunks_info = []  # Keep track of chunks for cleanup
+
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_chunk = {}
+
+        # Progress bar (update total as chunks arrive if not provided)
+        pbar = tqdm(desc="Translating", unit="chunk", total=total_chunks)
+
+        # Submit chunks as they arrive from generator
+        for chunk in chunks_generator:
+            chunks_info.append(chunk)
+            future = executor.submit(process_chunk_translate, chunk)
+            future_to_chunk[future] = chunk
+
+            # Update total if we didn't know it upfront
+            if total_chunks is None:
+                pbar.total = len(chunks_info)
+                pbar.refresh()
+
+        # All chunks submitted, now collect results as they complete
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                segments = future.result()
+                all_segments.extend(segments)
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error processing chunk "
+                    f"{chunk['chunk_path']}: {e}"
+                )
+            pbar.update(1)
+
+        pbar.close()
+
+    # Sort all segments by start time
+    all_segments.sort(key=lambda x: x["start"])
+
+    logger.info(f"Translation complete. Total segments: {len(all_segments)}")
 
     return all_segments, chunks_info
 
