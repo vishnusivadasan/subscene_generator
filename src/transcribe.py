@@ -8,7 +8,7 @@ from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from utils import logger
-from config import client, WORKERS, GPT_MODEL, ENABLE_CORRECTION, CORRECTION_BATCH_SIZE
+from config import client, WORKERS, GPT_MODEL, ENABLE_CORRECTION, TRANSLATION_BATCH_MINUTES
 
 
 def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
@@ -131,20 +131,28 @@ def transcribe_audio(chunks_info: List[Dict[str, any]], workers: int = None) -> 
     return all_segments
 
 
-def translate_segment(segment: Dict[str, any]) -> Dict[str, any]:
+def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[str, any]]:
     """
-    Translate a single segment using GPT-4.
+    Translate a batch of segments using GPT-4 with full context.
 
     Args:
-        segment: Dictionary with start, end, and text (original language)
+        batch: List of segments within a time window
+        batch_num: Batch number for logging
 
     Returns:
-        Segment with translated English text
+        List of translated segments
     """
-    original_text = segment["text"]
-
     max_retries = 3
     backoff_times = [1, 2, 4]
+
+    # Format batch for GPT
+    batch_text = []
+    for idx, seg in enumerate(batch, 1):
+        # Include timestamp for context
+        timestamp = f"[{int(seg['start']//60):02d}:{int(seg['start']%60):02d}]"
+        batch_text.append(f"{idx}. {timestamp} {seg['text']}")
+
+    batch_input = "\n".join(batch_text)
 
     for attempt in range(max_retries):
         try:
@@ -153,44 +161,61 @@ def translate_segment(segment: Dict[str, any]) -> Dict[str, any]:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a professional subtitle translator. Translate Japanese to natural English. "
-                                   "Preserve tone, nuance, emotion, and intent. Do NOT censor or soften the meaning. "
-                                   "Output only the translation, no explanations."
+                        "content": "You are a professional subtitle translator. Translate these Japanese subtitle lines to natural English. "
+                                   "Preserve conversational flow, tone, nuance, emotion, and context between lines. "
+                                   "Do NOT censor or soften the meaning. "
+                                   "Return ONLY the translations in the same numbered format, without timestamps."
                     },
                     {
                         "role": "user",
-                        "content": f'Translate this Japanese subtitle line to natural English:\n\n"{original_text}"'
+                        "content": f"Translate these Japanese subtitles to English:\n\n{batch_input}"
                     }
                 ],
                 temperature=0.3,
-                max_tokens=200
+                max_tokens=4000
             )
 
             translated_text = response.choices[0].message.content.strip()
-            # Remove quotes if GPT added them
-            if translated_text.startswith('"') and translated_text.endswith('"'):
-                translated_text = translated_text[1:-1]
 
-            return {
-                "start": segment["start"],
-                "end": segment["end"],
-                "text": translated_text,
-                "original": original_text  # Keep original for debugging
-            }
+            # Parse translated lines
+            translated_lines = []
+            for line in translated_text.split("\n"):
+                line = line.strip()
+                if line and ". " in line:
+                    # Remove number prefix
+                    text = line.split(". ", 1)[1] if ". " in line else line
+                    translated_lines.append(text)
+
+            # Map translations back to segments
+            result = []
+            for idx, seg in enumerate(batch):
+                if idx < len(translated_lines):
+                    result.append({
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "text": translated_lines[idx],
+                        "original": seg["text"]
+                    })
+                else:
+                    # Fallback if parsing fails
+                    logger.warning(f"Translation parsing issue for segment {idx+1} in batch {batch_num}")
+                    result.append(seg)
+
+            return result
 
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(backoff_times[attempt])
             else:
-                logger.warning(f"Translation failed for segment, using original: {e}")
-                return segment
+                logger.error(f"Translation failed for batch {batch_num}, using originals: {e}")
+                return batch
 
-    return segment
+    return batch
 
 
 def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> List[Dict[str, any]]:
     """
-    Translate all segments using GPT-4 in parallel.
+    Translate all segments using GPT-4 with time-based batching for better context.
 
     Args:
         segments: List of segments with original language text
@@ -202,41 +227,63 @@ def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> L
     if workers is None:
         workers = WORKERS
 
+    # Create time-based batches
+    batch_window_seconds = TRANSLATION_BATCH_MINUTES * 60
+    batches = []
+    current_batch = []
+    batch_start_time = 0
+
+    for segment in segments:
+        # Check if we need to start a new batch
+        if segment["start"] >= batch_start_time + batch_window_seconds and current_batch:
+            batches.append(current_batch)
+            current_batch = [segment]
+            batch_start_time = segment["start"]
+        else:
+            if not current_batch:
+                batch_start_time = segment["start"]
+            current_batch.append(segment)
+
+    # Add the last batch
+    if current_batch:
+        batches.append(current_batch)
+
     logger.info(f"Starting parallel translation with {workers} workers")
     logger.info(f"Using model: {GPT_MODEL}")
+    logger.info(f"Batching: {len(batches)} batches ({TRANSLATION_BATCH_MINUTES}-minute windows)")
 
-    translated_segments = []
+    all_translated = []
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        # Submit all segments for translation
-        future_to_segment = {
-            executor.submit(translate_segment, segment): segment
-            for segment in segments
+        # Submit all batches for translation
+        future_to_batch = {
+            executor.submit(translate_batch, batch, idx): (batch, idx)
+            for idx, batch in enumerate(batches, 1)
         }
 
         # Collect results with progress bar
-        with tqdm(total=len(segments), desc="Translating", unit="segment") as pbar:
-            for future in as_completed(future_to_segment):
+        with tqdm(total=len(batches), desc="Translating", unit="batch") as pbar:
+            for future in as_completed(future_to_batch):
                 try:
-                    translated = future.result()
-                    translated_segments.append(translated)
+                    translated_batch = future.result()
+                    all_translated.extend(translated_batch)
                 except Exception as e:
-                    segment = future_to_segment[future]
-                    logger.error(f"Unexpected error translating segment: {e}")
-                    translated_segments.append(segment)  # Keep original on error
+                    batch, batch_num = future_to_batch[future]
+                    logger.error(f"Unexpected error translating batch {batch_num}: {e}")
+                    all_translated.extend(batch)  # Keep originals on error
                 pbar.update(1)
 
     # Sort by start time
-    translated_segments.sort(key=lambda x: x["start"])
+    all_translated.sort(key=lambda x: x["start"])
 
-    logger.info(f"Translation complete. Total segments: {len(translated_segments)}")
+    logger.info(f"Translation complete. Total segments: {len(all_translated)}")
 
-    return translated_segments
+    return all_translated
 
 
 def correct_translations(segments: List[Dict[str, any]]) -> List[Dict[str, any]]:
     """
-    Correct and improve translations using GPT-4 with batched context.
+    Correct and improve translations using GPT-4 with time-based batching for context.
 
     Args:
         segments: List of translated segments
@@ -244,14 +291,31 @@ def correct_translations(segments: List[Dict[str, any]]) -> List[Dict[str, any]]
     Returns:
         List of corrected segments
     """
-    logger.info(f"Starting translation correction (batch size: {CORRECTION_BATCH_SIZE})")
+    # Use same batching strategy as translation (time-based windows)
+    batch_window_seconds = TRANSLATION_BATCH_MINUTES * 60
+    batches = []
+    current_batch = []
+    batch_start_time = 0
+
+    for segment in segments:
+        if segment["start"] >= batch_start_time + batch_window_seconds and current_batch:
+            batches.append(current_batch)
+            current_batch = [segment]
+            batch_start_time = segment["start"]
+        else:
+            if not current_batch:
+                batch_start_time = segment["start"]
+            current_batch.append(segment)
+
+    if current_batch:
+        batches.append(current_batch)
+
+    logger.info(f"Starting translation correction ({len(batches)} batches, {TRANSLATION_BATCH_MINUTES}-minute windows)")
 
     corrected_segments = []
 
-    # Process in batches
-    for i in tqdm(range(0, len(segments), CORRECTION_BATCH_SIZE), desc="Correcting", unit="batch"):
-        batch = segments[i:i + CORRECTION_BATCH_SIZE]
-
+    # Process batches sequentially with progress bar
+    for batch_num, batch in enumerate(tqdm(batches, desc="Correcting", unit="batch"), 1):
         # Create batch text
         batch_text = "\n".join([f"{idx+1}. {seg['text']}" for idx, seg in enumerate(batch)])
 
@@ -263,8 +327,9 @@ def correct_translations(segments: List[Dict[str, any]]) -> List[Dict[str, any]]
                         "role": "system",
                         "content": "You are a professional subtitle editor. Clean up the following English subtitle lines "
                                    "so they are natural, accurate, and preserve the emotional meaning of the original Japanese. "
-                                   "Fix mistranslations, unnatural phrasing, and missing nuance. Do not censor content. "
-                                   "Return ONLY the corrected lines in the same numbered format."
+                                   "Fix mistranslations, unnatural phrasing, and missing nuance. "
+                                   "Maintain conversational flow and context between lines. "
+                                   "Do not censor content. Return ONLY the corrected lines in the same numbered format."
                     },
                     {
                         "role": "user",
@@ -272,7 +337,7 @@ def correct_translations(segments: List[Dict[str, any]]) -> List[Dict[str, any]]
                     }
                 ],
                 temperature=0.3,
-                max_tokens=1000
+                max_tokens=4000
             )
 
             corrected_text = response.choices[0].message.content.strip()
@@ -293,7 +358,7 @@ def correct_translations(segments: List[Dict[str, any]]) -> List[Dict[str, any]]
                 corrected_segments.append(seg)
 
         except Exception as e:
-            logger.warning(f"Correction failed for batch, using uncorrected: {e}")
+            logger.warning(f"Correction failed for batch {batch_num}, using uncorrected: {e}")
             corrected_segments.extend(batch)
 
     logger.info("Correction complete")
