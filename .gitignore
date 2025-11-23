@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Environment Variables (contains API key)
+.env
+
+# Temporary Audio/Video Files
+audio/
+*.mp4
+*.wav
+*.srt
+
+# Test Directory
+test/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,302 @@
+**You are building a complete Python project that takes any video file, extracts its audio, splits it into chunks, sends each chunk IN PARALLEL to the OpenAI Whisper API, automatically detects its language, ALWAYS translates to English, and outputs a .srt subtitle file. Follow ALL requirements exactly.**
+
+**TEST FILE:** A file called `test_file.mp4` is provided in the project directory for testing purposes. It has sufficient dialogue in its first 3 minutes to run small tests on whenever needed.
+
+---
+
+# 📦 PROJECT OVERVIEW
+
+Build a Python application that:
+
+1. Accepts a video file path as an argument
+2. Extracts audio using ffmpeg
+3. Converts audio to WAV, mono, 16 kHz, PCM
+4. Splits audio into ~80-second chunks
+5. Runs **parallel Whisper API calls** (default 4 workers)
+6. Automatically detects language
+7. Always translates to English (`translate=True`)
+8. Combines all segments with correct timing
+9. Produces a valid `.srt` file
+10. Saves subtitles inside the `subtitles/` folder
+
+---
+
+# 📁 FOLDER STRUCTURE
+
+Create this exact structure:
+
+```
+whisper-subtitle-project/
+│
+├── input_videos/
+├── audio/
+├── subtitles/
+│
+├── src/
+│   ├── extract_audio.py
+│   ├── chunk_audio.py
+│   ├── transcribe.py
+│   ├── merge_srt.py
+│   └── utils.py
+│
+├── main.py
+├── config.py
+├── requirements.txt
+└── .env    # user will put OPENAI_API_KEY here
+```
+
+---
+
+# 🧩 MODULE REQUIREMENTS
+
+---
+
+## A. `src/extract_audio.py`
+
+Implement audio extraction:
+
+* Use ffmpeg through `subprocess.run`
+* Output file path: `audio/<video_basename>.wav`
+* Format:
+
+  * PCM 16-bit
+  * mono
+  * 16 kHz
+
+ffmpeg command:
+
+```
+ffmpeg -i <video> -vn -acodec pcm_s16le -ar 16000 -ac 1 <output.wav> -y
+```
+
+Raise an error if extraction fails.
+
+---
+
+## B. `src/chunk_audio.py`
+
+Implement audio chunking:
+
+* Use `pydub.AudioSegment` to load WAV
+* Split into chunks of **80,000 ms**
+* Save chunks in `audio/` directory
+* Return a list of dictionaries:
+
+```
+[
+  {
+    "chunk_path": "audio/chunk_0.wav",
+    "offset_seconds": 0.0
+  },
+  {
+    "chunk_path": "audio/chunk_80000.wav",
+    "offset_seconds": 80.0
+  },
+  ...
+]
+```
+
+* Clean up chunk files after use.
+
+---
+
+## C. `src/transcribe.py` — PARALLEL API CALLS
+
+This module must use **parallel Whisper API calls**.
+
+### Function signature:
+
+```python
+def transcribe_audio(audio_path: str, workers: int = None)
+```
+
+### Worker Count Logic:
+
+* Default = 4
+* If `.env` contains `WORKERS`, override default
+* If function argument `workers` is passed, override both
+
+### Parallel Execution:
+
+Use:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+```
+
+Steps:
+
+1. Receive list of chunks
+2. Use `ThreadPoolExecutor(max_workers=workers)`
+3. Submit *each chunk* to `process_chunk()`
+4. Collect all results
+5. Combine into one list
+6. Sort by `"start"`
+7. Return final merged list
+
+### `process_chunk(chunk_info)` Requirements:
+
+Input:
+
+```
+{
+  "chunk_path": "...",
+  "offset_seconds": float
+}
+```
+
+Logic:
+
+1. Retry Whisper API request up to **3 times**
+2. Exponential backoff: **1s → 2s → 4s**
+3. Catch:
+
+   * HTTP 429 rate limits
+   * timeouts
+   * connection resets
+4. On success:
+
+   * Adjust timestamps:
+
+     ```
+     seg["start"] += offset_seconds
+     seg["end"]   += offset_seconds
+     ```
+
+   * Return a list of segments
+5. On final failure:
+
+   * Log:
+
+     ```
+     [ERROR] Failed chunk at offset Xs after 3 attempts
+     ```
+
+   * Return empty list
+
+   * The system must **continue** (no crash)
+
+### Required logging:
+
+```
+[Worker] Processing chunk offset 160s
+[Worker] Retry #1 after rate limit
+[Worker] Completed chunk offset 160s
+```
+
+---
+
+## D. `src/merge_srt.py` — SRT Writer
+
+Implement:
+
+* Sort segments by start time
+* Format timestamps:
+
+```
+HH:MM:SS,mmm
+```
+
+* Build SRT block:
+
+```
+1
+00:00:05,120 --> 00:00:07,900
+Translated text here
+```
+
+* Save to:
+
+```
+subtitles/<video_basename>.srt
+```
+
+* Use UTF-8 encoding
+
+---
+
+## E. `config.py`
+
+Implement environment loading:
+
+* Use `python-dotenv`
+* Load `.env`
+* Provide access to:
+
+  * `OPENAI_API_KEY`
+  * `WORKERS`
+* Create a **singleton `OpenAI()` client** and export it
+
+If no API key → raise a clear error.
+
+---
+
+## F. `main.py`
+
+Use `argparse` to accept a video path:
+
+```
+python main.py input_videos/myvideo.mp4
+```
+
+Flow:
+
+1. Extract audio
+2. Chunk audio
+3. Transcribe chunks in parallel
+4. Save merged SRT
+5. Print final output path
+
+---
+
+# 📜 requirements.txt
+
+Include:
+
+```
+python-dotenv
+openai>=1.0.0
+pydub
+ffmpeg-python
+```
+
+Include any additional libraries Claude uses.
+
+---
+
+# 🧪 SOFTWARE BEHAVIOR REQUIREMENTS
+
+* Must handle multi-hour videos
+* Parallel chunk processing
+* Accurate timestamp alignment
+* Robust retry & rate limit handling
+* Clean up temporary chunks
+* No crashes if one chunk fails
+* UTF-8 everywhere
+* Must handle paths with spaces
+* Accept both absolute and relative paths
+
+---
+
+# 📝 FINAL DELIVERABLES
+
+Claude must output:
+
+1. Full code for **all** project files
+2. The complete `requirements.txt`
+3. A sample `.env`
+4. Instructions to run the project:
+
+```
+python main.py path/to/video.mp4
+```
+
+5. A summary explaining how the pipeline works
+
+---
+
+# ✅ END OF CLAUDE INSTRUCTION SET
+
+---
+
+

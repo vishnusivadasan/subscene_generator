@@ -1,0 +1,35 @@
+"""
+Configuration module for Whisper Subtitle Generator.
+Loads environment variables and creates OpenAI client singleton.
+"""
+
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Get OpenAI API key
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError(
+        "OPENAI_API_KEY not found in environment. "
+        "Please add it to your .env file."
+    )
+
+# Get worker count (default to 4 if not specified)
+WORKERS = int(os.getenv("WORKERS", "4"))
+
+# Create singleton OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Audio chunk duration in milliseconds (80 seconds)
+CHUNK_DURATION_MS = 80000
+
+# Audio settings for extraction
+AUDIO_SETTINGS = {
+    "sample_rate": 16000,  # 16 kHz
+    "channels": 1,          # mono
+    "codec": "pcm_s16le"    # PCM 16-bit
+}
