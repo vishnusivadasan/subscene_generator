@@ -12,8 +12,9 @@ from pathlib import Path
 from utils import validate_video_path, logger, cleanup_files
 from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
-from src.transcribe import transcribe_audio
+from src.transcribe import transcribe_audio, translate_segments, correct_translations
 from src.merge_srt import save_subtitles
+from config import ENABLE_CORRECTION
 
 
 def main():
@@ -44,6 +45,18 @@ Examples:
         help="Number of parallel workers for transcription (default: from config or 4)"
     )
 
+    parser.add_argument(
+        "--no-correction",
+        action="store_true",
+        help="Disable GPT-4 correction step (faster but lower quality)"
+    )
+
+    parser.add_argument(
+        "--with-correction",
+        action="store_true",
+        help="Enable GPT-4 correction step (overrides .env setting)"
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -56,16 +69,26 @@ Examples:
         video_path = validate_video_path(args.video_path)
         logger.info(f"Input video: {video_path}")
 
+        # Determine if correction should be enabled
+        enable_correction = ENABLE_CORRECTION
+        if args.with_correction:
+            enable_correction = True
+        elif args.no_correction:
+            enable_correction = False
+
+        # Determine total steps
+        total_steps = 5 if enable_correction else 4
+
         # Step 1: Extract audio
-        logger.info("\n[1/4] Extracting audio...")
+        logger.info(f"\n[1/{total_steps}] Extracting audio...")
         audio_path = extract_audio(video_path)
 
         # Step 2: Chunk audio
-        logger.info("\n[2/4] Chunking audio...")
+        logger.info(f"\n[2/{total_steps}] Chunking audio...")
         chunks_info = chunk_audio(audio_path)
 
-        # Step 3: Transcribe chunks in parallel
-        logger.info("\n[3/4] Transcribing audio (this may take a while)...")
+        # Step 3: Transcribe chunks in parallel (original language)
+        logger.info(f"\n[3/{total_steps}] Transcribing audio (this may take a while)...")
         segments = transcribe_audio(chunks_info, workers=args.workers)
 
         # Clean up chunk files
@@ -76,8 +99,20 @@ Examples:
             logger.error("No transcription segments were generated. Cannot create subtitle file.")
             sys.exit(1)
 
-        # Step 4: Save subtitles
-        logger.info("\n[4/4] Generating subtitle file...")
+        # Step 4: Translate to English using GPT-4
+        step_num = 4
+        logger.info(f"\n[{step_num}/{total_steps}] Translating to English with GPT-4...")
+        segments = translate_segments(segments, workers=args.workers)
+
+        # Step 5 (optional): Correct translations
+        if enable_correction:
+            step_num += 1
+            logger.info(f"\n[{step_num}/{total_steps}] Correcting translations with GPT-4...")
+            segments = correct_translations(segments)
+
+        # Final step: Save subtitles
+        step_num += 1
+        logger.info(f"\n[{step_num}/{total_steps}] Generating subtitle file...")
         srt_path = save_subtitles(segments, video_path)
 
         # Clean up extracted audio file

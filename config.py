@@ -26,6 +26,11 @@ if not OPENAI_API_KEY:
 # Get worker count (default to 4 if not specified)
 WORKERS = int(os.getenv("WORKERS", "4"))
 
+# GPT translation settings
+GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")  # Use gpt-4o for best quality
+ENABLE_CORRECTION = os.getenv("ENABLE_CORRECTION", "false").lower() == "true"
+CORRECTION_BATCH_SIZE = int(os.getenv("CORRECTION_BATCH_SIZE", "30"))
+
 # Create singleton OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 

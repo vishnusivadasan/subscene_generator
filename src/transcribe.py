@@ -8,7 +8,7 @@ from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from utils import logger
-from config import client, WORKERS
+from config import client, WORKERS, GPT_MODEL, ENABLE_CORRECTION, CORRECTION_BATCH_SIZE
 
 
 def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
@@ -30,9 +30,9 @@ def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
 
     for attempt in range(max_retries):
         try:
-            # Open audio file and send to Whisper API for translation to English
+            # Open audio file and send to Whisper API for transcription (original language)
             with open(chunk_path, "rb") as audio_file:
-                response = client.audio.translations.create(
+                response = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
                     response_format="verbose_json"
@@ -129,3 +129,173 @@ def transcribe_audio(chunks_info: List[Dict[str, any]], workers: int = None) -> 
     logger.info(f"Transcription complete. Total segments: {len(all_segments)}")
 
     return all_segments
+
+
+def translate_segment(segment: Dict[str, any]) -> Dict[str, any]:
+    """
+    Translate a single segment using GPT-4.
+
+    Args:
+        segment: Dictionary with start, end, and text (original language)
+
+    Returns:
+        Segment with translated English text
+    """
+    original_text = segment["text"]
+
+    max_retries = 3
+    backoff_times = [1, 2, 4]
+
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a professional subtitle translator. Translate Japanese to natural English. "
+                                   "Preserve tone, nuance, emotion, and intent. Do NOT censor or soften the meaning. "
+                                   "Output only the translation, no explanations."
+                    },
+                    {
+                        "role": "user",
+                        "content": f'Translate this Japanese subtitle line to natural English:\n\n"{original_text}"'
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=200
+            )
+
+            translated_text = response.choices[0].message.content.strip()
+            # Remove quotes if GPT added them
+            if translated_text.startswith('"') and translated_text.endswith('"'):
+                translated_text = translated_text[1:-1]
+
+            return {
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": translated_text,
+                "original": original_text  # Keep original for debugging
+            }
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(backoff_times[attempt])
+            else:
+                logger.warning(f"Translation failed for segment, using original: {e}")
+                return segment
+
+    return segment
+
+
+def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> List[Dict[str, any]]:
+    """
+    Translate all segments using GPT-4 in parallel.
+
+    Args:
+        segments: List of segments with original language text
+        workers: Number of parallel workers (overrides config if provided)
+
+    Returns:
+        List of segments with translated English text
+    """
+    if workers is None:
+        workers = WORKERS
+
+    logger.info(f"Starting parallel translation with {workers} workers")
+    logger.info(f"Using model: {GPT_MODEL}")
+
+    translated_segments = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # Submit all segments for translation
+        future_to_segment = {
+            executor.submit(translate_segment, segment): segment
+            for segment in segments
+        }
+
+        # Collect results with progress bar
+        with tqdm(total=len(segments), desc="Translating", unit="segment") as pbar:
+            for future in as_completed(future_to_segment):
+                try:
+                    translated = future.result()
+                    translated_segments.append(translated)
+                except Exception as e:
+                    segment = future_to_segment[future]
+                    logger.error(f"Unexpected error translating segment: {e}")
+                    translated_segments.append(segment)  # Keep original on error
+                pbar.update(1)
+
+    # Sort by start time
+    translated_segments.sort(key=lambda x: x["start"])
+
+    logger.info(f"Translation complete. Total segments: {len(translated_segments)}")
+
+    return translated_segments
+
+
+def correct_translations(segments: List[Dict[str, any]]) -> List[Dict[str, any]]:
+    """
+    Correct and improve translations using GPT-4 with batched context.
+
+    Args:
+        segments: List of translated segments
+
+    Returns:
+        List of corrected segments
+    """
+    logger.info(f"Starting translation correction (batch size: {CORRECTION_BATCH_SIZE})")
+
+    corrected_segments = []
+
+    # Process in batches
+    for i in tqdm(range(0, len(segments), CORRECTION_BATCH_SIZE), desc="Correcting", unit="batch"):
+        batch = segments[i:i + CORRECTION_BATCH_SIZE]
+
+        # Create batch text
+        batch_text = "\n".join([f"{idx+1}. {seg['text']}" for idx, seg in enumerate(batch)])
+
+        try:
+            response = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a professional subtitle editor. Clean up the following English subtitle lines "
+                                   "so they are natural, accurate, and preserve the emotional meaning of the original Japanese. "
+                                   "Fix mistranslations, unnatural phrasing, and missing nuance. Do not censor content. "
+                                   "Return ONLY the corrected lines in the same numbered format."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Clean up these subtitle lines:\n\n{batch_text}"
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=1000
+            )
+
+            corrected_text = response.choices[0].message.content.strip()
+
+            # Parse corrected lines
+            corrected_lines = []
+            for line in corrected_text.split("\n"):
+                line = line.strip()
+                if line and ". " in line:
+                    # Remove number prefix
+                    text = line.split(". ", 1)[1] if ". " in line else line
+                    corrected_lines.append(text)
+
+            # Update segments with corrected text
+            for idx, seg in enumerate(batch):
+                if idx < len(corrected_lines):
+                    seg["text"] = corrected_lines[idx]
+                corrected_segments.append(seg)
+
+        except Exception as e:
+            logger.warning(f"Correction failed for batch, using uncorrected: {e}")
+            corrected_segments.extend(batch)
+
+    logger.info("Correction complete")
+
+    return corrected_segments
