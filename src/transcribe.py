@@ -204,10 +204,12 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
 
             translated_text = response.choices[0].message.content.strip()
 
-            # Check if response is empty or too short
-            if not translated_text or len(translated_text) < 10:
+            # Check if response is empty or significantly shorter than input (indicates failure)
+            # Use 30% threshold: if output < 30% of input length, likely a failure
+            min_expected_length = max(10, len(batch_input) * 0.3)  # At least 10 chars or 30% of input
+            if not translated_text or len(translated_text) < min_expected_length:
                 if attempt < max_retries - 1:
-                    logger.warning(f"Batch {batch_num} attempt {attempt + 1}: GPT-4 returned empty/short response. Retrying...")
+                    logger.warning(f"Batch {batch_num} attempt {attempt + 1}: GPT-4 returned empty/short response ({len(translated_text)} chars, expected >{min_expected_length:.0f}). Retrying...")
                     time.sleep(backoff_times[attempt])
                     continue
                 else:
