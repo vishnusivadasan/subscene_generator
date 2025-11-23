@@ -36,6 +36,11 @@ ENABLE_CORRECTION = os.getenv("ENABLE_CORRECTION", "false").lower() == "true"
 TRANSLATION_BATCH_MINUTES = int(os.getenv("TRANSLATION_BATCH_MINUTES", "5"))  # Group segments by time window
 MAX_SEGMENTS_PER_BATCH = int(os.getenv("MAX_SEGMENTS_PER_BATCH", "60"))  # Split if batch exceeds this
 
+# Translation provider settings
+BULK_TRANSLATOR = os.getenv("BULK_TRANSLATOR", "openai")  # "openai" or "google"
+FALLBACK_CHAIN = os.getenv("FALLBACK_CHAIN", "google,openai,untranslated").split(",")  # Fallback order
+GOOGLE_BUNDLE_SIZE = int(os.getenv("GOOGLE_BUNDLE_SIZE", "20"))  # Lines per Google API call
+
 # Create singleton OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 

@@ -14,7 +14,7 @@ from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
 from src.transcribe import transcribe_audio, transcribe_audio_translate, translate_segments, correct_translations
 from src.merge_srt import save_subtitles, save_japanese_srt, load_japanese_srt
-from config import ENABLE_CORRECTION
+from config import ENABLE_CORRECTION, BULK_TRANSLATOR, FALLBACK_CHAIN
 
 
 def main():
@@ -69,6 +69,21 @@ Examples:
         help="Use Whisper's direct translation to English (faster, cheaper, but lower quality than GPT-4 translation)"
     )
 
+    parser.add_argument(
+        "--bulk-translator",
+        type=str,
+        choices=["openai", "google"],
+        default=None,
+        help="Bulk translation method: 'openai' (high quality, costs money) or 'google' (fast, free, lower quality). Overrides BULK_TRANSLATOR from config."
+    )
+
+    parser.add_argument(
+        "--fallback-chain",
+        type=str,
+        default=None,
+        help="Comma-separated fallback chain for failed translations (e.g., 'google,openai,untranslated'). Overrides FALLBACK_CHAIN from config."
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -92,6 +107,12 @@ Examples:
         if args.direct_whisper and enable_correction:
             logger.warning("--direct-whisper is incompatible with correction. Disabling correction.")
             enable_correction = False
+
+        # Determine bulk translator (CLI overrides config)
+        bulk_translator = args.bulk_translator if args.bulk_translator else BULK_TRANSLATOR
+
+        # Determine fallback chain (CLI overrides config)
+        fallback_chain = args.fallback_chain.split(',') if args.fallback_chain else FALLBACK_CHAIN
 
         # Determine total steps
         if args.direct_whisper:
@@ -142,10 +163,12 @@ Examples:
             # Clean up extracted audio file
             cleanup_files(audio_path)
 
-        # Step 3: Translate to English using GPT-4 (skip if using direct Whisper)
+        # Step 3: Translate to English (skip if using direct Whisper)
         if not args.direct_whisper:
-            logger.info(f"\n[3/{total_steps}] Translating to English with GPT-4...")
-            segments = translate_segments(segments)  # Uses TRANSLATION_WORKERS from config
+            translator_name = bulk_translator.upper()
+            logger.info(f"\n[3/{total_steps}] Translating to English with {translator_name}...")
+            logger.info(f"Fallback chain: {' → '.join(fallback_chain)}")
+            segments = translate_segments(segments, bulk_translator=bulk_translator, fallback_chain=fallback_chain)
 
         # Step 4 (optional): Correct translations (only in normal mode)
         if enable_correction and not args.direct_whisper:

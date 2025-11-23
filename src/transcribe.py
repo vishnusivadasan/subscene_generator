@@ -276,66 +276,110 @@ def transcribe_audio_translate(chunks_generator, total_chunks: int = None, worke
     return all_segments, chunks_info
 
 
-def translate_single_line(segment: Dict[str, any], line_num: int) -> Dict[str, any]:
+def translate_single_line(segment: Dict[str, any], line_num: int, fallback_chain: List[str] = None) -> Dict[str, any]:
     """
-    Translate a single segment using GPT-4.
-    Used as fallback when batch translation fails.
+    Translate a single segment using the fallback chain.
+    Tries each method in order until one succeeds.
 
     Args:
         segment: Single segment to translate
         line_num: Line number for logging
+        fallback_chain: List of translation methods to try in order (e.g., ["google", "openai", "untranslated"])
 
     Returns:
-        Translated segment or original if translation fails
+        Translated segment or original if all translations fail
     """
-    try:
-        response = client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a professional subtitle translator. Translate Japanese subtitle lines to natural English. "
-                               "Preserve conversational flow, tone, nuance, and emotion. "
-                               "Do NOT censor or soften meaning - translate all content directly."
-                },
-                {
-                    "role": "user",
-                    "content": f"Translate this Japanese subtitle to English:\n\n{segment['text']}"
+    if fallback_chain is None:
+        fallback_chain = ["openai", "untranslated"]
+
+    for method in fallback_chain:
+        try:
+            if method == "google":
+                # Try Google Translate
+                from src.translate_google import translate_single_line_google
+                return translate_single_line_google(segment, line_num)
+
+            elif method == "openai":
+                # Try OpenAI GPT-4
+                response = client.chat.completions.create(
+                    model=GPT_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a professional subtitle translator. Translate Japanese subtitle lines to natural English. "
+                                       "Preserve conversational flow, tone, nuance, and emotion. "
+                                       "Do NOT censor or soften meaning - translate all content directly."
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Translate this Japanese subtitle to English:\n\n{segment['text']}"
+                        }
+                    ],
+                    temperature=0.3,
+                    max_tokens=200
+                )
+
+                translated_text = response.choices[0].message.content.strip()
+
+                if translated_text:
+                    return {
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": translated_text,
+                        "original": segment["text"]
+                    }
+                else:
+                    # Empty response, try next method
+                    logger.warning(f"Line {line_num}: OpenAI returned empty response, trying next fallback")
+                    continue
+
+            elif method == "untranslated":
+                # Keep original Japanese text
+                logger.warning(f"Line {line_num}: Using untranslated Japanese text")
+                return {
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "text": segment["text"],
+                    "original": segment["text"]
                 }
-            ],
-            temperature=0.3,
-            max_tokens=200
-        )
 
-        translated_text = response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"Line {line_num}: {method} translation failed ({str(e)}), trying next fallback")
+            continue
 
-        if translated_text:
-            return {
-                "start": segment["start"],
-                "end": segment["end"],
-                "text": translated_text,
-                "original": segment["text"]
-            }
-        else:
-            logger.warning(f"Line {line_num}: Empty response, using original")
-            return segment
-
-    except Exception as e:
-        logger.warning(f"Line {line_num}: Individual translation failed ({str(e)}), using original")
-        return segment
+    # If all methods fail, return original
+    logger.error(f"Line {line_num}: All fallback methods failed, using original")
+    return {
+        "start": segment["start"],
+        "end": segment["end"],
+        "text": segment.get("text", ""),
+        "original": segment.get("text", "")
+    }
 
 
-def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[str, any]]:
+def translate_batch(batch: List[Dict[str, any]], batch_num: int,
+                   bulk_translator: str = "openai", fallback_chain: List[str] = None) -> List[Dict[str, any]]:
     """
-    Translate a batch of segments using GPT-4 with full context.
+    Translate a batch of segments using the specified translator.
 
     Args:
         batch: List of segments within a time window
         batch_num: Batch number for logging
+        bulk_translator: Bulk translation method ("openai" or "google")
+        fallback_chain: Fallback chain for failed translations
 
     Returns:
         List of translated segments
     """
+    if fallback_chain is None:
+        fallback_chain = ["openai", "untranslated"]
+
+    # Route to appropriate translator
+    if bulk_translator == "google":
+        from src.translate_google import translate_batch_google
+        return translate_batch_google(batch, batch_num)
+
+    # Default: OpenAI GPT-4 translation
     max_retries = 3
     backoff_times = [1, 2, 4]
 
@@ -401,10 +445,10 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
                     logger.error(f"Batch {batch_num} final response: {response_preview}")
                     logger.info(f"Batch {batch_num}: Attempting line-by-line translation fallback for {len(batch)} segments...")
 
-                    # Try translating each line individually
+                    # Try translating each line individually using fallback chain
                     result = []
                     for idx, seg in enumerate(batch, 1):
-                        translated_seg = translate_single_line(seg, idx)
+                        translated_seg = translate_single_line(seg, idx, fallback_chain)
                         result.append(translated_seg)
 
                     logger.info(f"Batch {batch_num}: Line-by-line fallback complete")
@@ -486,10 +530,10 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
                 logger.error(f"Batch {batch_num}: Translation failed after {max_retries} attempts: {e}")
                 logger.info(f"Batch {batch_num}: Attempting line-by-line translation fallback for {len(batch)} segments...")
 
-                # Try translating each line individually
+                # Try translating each line individually using fallback chain
                 result = []
                 for idx, seg in enumerate(batch, 1):
-                    translated_seg = translate_single_line(seg, idx)
+                    translated_seg = translate_single_line(seg, idx, fallback_chain)
                     result.append(translated_seg)
 
                 logger.info(f"Batch {batch_num}: Line-by-line fallback complete")
@@ -498,19 +542,25 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
     return batch
 
 
-def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> List[Dict[str, any]]:
+def translate_segments(segments: List[Dict[str, any]], workers: int = None,
+                      bulk_translator: str = "openai", fallback_chain: List[str] = None) -> List[Dict[str, any]]:
     """
-    Translate all segments using GPT-4 with time-based batching for better context.
+    Translate all segments with time-based batching for better context.
 
     Args:
         segments: List of segments with original language text
         workers: Number of parallel workers (overrides config if provided)
+        bulk_translator: Bulk translation method ("openai" or "google")
+        fallback_chain: Fallback chain for failed translations (e.g., ["google", "openai", "untranslated"])
 
     Returns:
         List of segments with translated English text
     """
     if workers is None:
         workers = TRANSLATION_WORKERS
+
+    if fallback_chain is None:
+        fallback_chain = ["openai", "untranslated"]
 
     # Create time-based batches
     batch_window_seconds = TRANSLATION_BATCH_MINUTES * 60
@@ -543,8 +593,16 @@ def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> L
         else:
             final_batches.append(batch)
 
+    # For Google Translate, use sequential processing to avoid rate limits
+    # But batches can still run in parallel (workers parameter)
+    if bulk_translator == "google":
+        # Reduce workers for Google to avoid rate limiting
+        workers = min(workers, 2)
+        logger.info(f"Using Google Translate (rate-limited to {workers} parallel batches)")
+    else:
+        logger.info(f"Using model: {GPT_MODEL}")
+
     logger.info(f"Starting parallel translation with {workers} workers")
-    logger.info(f"Using model: {GPT_MODEL}")
     logger.info(f"Batching: {len(final_batches)} batches ({TRANSLATION_BATCH_MINUTES}-minute windows, max {MAX_SEGMENTS_PER_BATCH} segments/batch)")
 
     batches = final_batches
@@ -554,7 +612,7 @@ def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> L
     with ThreadPoolExecutor(max_workers=workers) as executor:
         # Submit all batches for translation
         future_to_batch = {
-            executor.submit(translate_batch, batch, idx): (batch, idx)
+            executor.submit(translate_batch, batch, idx, bulk_translator, fallback_chain): (batch, idx)
             for idx, batch in enumerate(batches, 1)
         }
 
