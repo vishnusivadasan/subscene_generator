@@ -208,12 +208,16 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
             # Use 30% threshold: if output < 30% of input length, likely a failure
             min_expected_length = max(10, len(batch_input) * 0.3)  # At least 10 chars or 30% of input
             if not translated_text or len(translated_text) < min_expected_length:
+                # Log the actual response for debugging (truncated to 200 chars)
+                response_preview = translated_text[:200] if translated_text else "(empty)"
                 if attempt < max_retries - 1:
-                    logger.warning(f"Batch {batch_num} attempt {attempt + 1}: GPT-4 returned empty/short response ({len(translated_text)} chars, expected >{min_expected_length:.0f}). Retrying...")
+                    logger.warning(f"Batch {batch_num} attempt {attempt + 1}: GPT-4 returned empty/short response ({len(translated_text)} chars, expected >{min_expected_length:.0f}).")
+                    logger.warning(f"Batch {batch_num} response preview: {response_preview}")
                     time.sleep(backoff_times[attempt])
                     continue
                 else:
                     logger.error(f"Batch {batch_num}: GPT-4 returned empty response after {max_retries} attempts. Using originals.")
+                    logger.error(f"Batch {batch_num} final response: {response_preview}")
                     return batch
 
             # Multi-strategy parsing with fallbacks
