@@ -5,7 +5,6 @@ Formats transcription segments into proper SRT format.
 
 from typing import List, Dict
 from pathlib import Path
-from tqdm import tqdm
 from utils import logger, ensure_directory, format_timestamp_srt, get_basename
 
 
@@ -22,10 +21,10 @@ def create_srt(segments: List[Dict[str, any]], output_path: str) -> None:
 
     logger.info(f"Generating SRT file with {len(segments)} segments")
 
-    # Build SRT content with progress bar
+    # Build SRT content
     srt_content = []
 
-    for index, segment in tqdm(enumerate(segments, start=1), total=len(segments), desc="Writing SRT", unit="segment"):
+    for index, segment in enumerate(segments, start=1):
         start_time = format_timestamp_srt(segment["start"])
         end_time = format_timestamp_srt(segment["end"])
         text = segment["text"]

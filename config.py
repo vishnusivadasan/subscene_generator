@@ -30,6 +30,7 @@ WORKERS = int(os.getenv("WORKERS", "4"))
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")  # Use gpt-4o for best quality
 ENABLE_CORRECTION = os.getenv("ENABLE_CORRECTION", "false").lower() == "true"
 TRANSLATION_BATCH_MINUTES = int(os.getenv("TRANSLATION_BATCH_MINUTES", "5"))  # Group segments by time window
+MAX_SEGMENTS_PER_BATCH = int(os.getenv("MAX_SEGMENTS_PER_BATCH", "60"))  # Split if batch exceeds this
 
 # Create singleton OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)

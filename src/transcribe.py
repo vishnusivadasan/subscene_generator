@@ -8,7 +8,7 @@ from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from utils import logger
-from config import client, WORKERS, GPT_MODEL, ENABLE_CORRECTION, TRANSLATION_BATCH_MINUTES
+from config import client, WORKERS, GPT_MODEL, ENABLE_CORRECTION, TRANSLATION_BATCH_MINUTES, MAX_SEGMENTS_PER_BATCH
 
 
 def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
@@ -161,14 +161,25 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a professional subtitle translator. Translate these Japanese subtitle lines to natural English. "
-                                   "Preserve conversational flow, tone, nuance, emotion, and context between lines. "
-                                   "Do NOT censor or soften the meaning. "
-                                   "Return ONLY the translations in the same numbered format, without timestamps."
+                        "content": "You are a professional subtitle translator. Translate Japanese subtitle lines to natural English.\n\n"
+                                   "CRITICAL RULES:\n"
+                                   "1. Return EXACTLY the same number of lines as the input\n"
+                                   "2. Use the EXACT same numbered format: '1. ', '2. ', '3. ', etc.\n"
+                                   "3. Do NOT skip any numbers\n"
+                                   "4. Do NOT add commentary or explanations\n"
+                                   "5. Preserve conversational flow, tone, nuance, and emotion\n"
+                                   "6. Do NOT censor or soften meaning\n\n"
+                                   "Example format:\n"
+                                   "Input:\n"
+                                   "1. [00:05] こんにちは\n"
+                                   "2. [00:08] 元気ですか\n\n"
+                                   "Output:\n"
+                                   "1. Hello\n"
+                                   "2. How are you"
                     },
                     {
                         "role": "user",
-                        "content": f"Translate these Japanese subtitles to English:\n\n{batch_input}"
+                        "content": f"Translate these {len(batch)} Japanese subtitles to English:\n\n{batch_input}"
                     }
                 ],
                 temperature=0.3,
@@ -177,29 +188,63 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
 
             translated_text = response.choices[0].message.content.strip()
 
-            # Parse translated lines
+            # Multi-strategy parsing with fallbacks
             translated_lines = []
+
+            # Strategy 1: Parse numbered format (preferred)
             for line in translated_text.split("\n"):
                 line = line.strip()
                 if line and ". " in line:
-                    # Remove number prefix
-                    text = line.split(". ", 1)[1] if ". " in line else line
-                    translated_lines.append(text)
+                    # Try to extract number and text
+                    parts = line.split(". ", 1)
+                    if len(parts) == 2 and parts[0].isdigit():
+                        translated_lines.append(parts[1].strip())
+
+            # Strategy 2: If count mismatch, try aggressive line extraction
+            if len(translated_lines) != len(batch):
+                logger.warning(f"Batch {batch_num}: Expected {len(batch)} lines, got {len(translated_lines)}. Using fallback parsing.")
+                translated_lines = []
+                for line in translated_text.split("\n"):
+                    line = line.strip()
+                    # Skip empty lines, headers, and metadata
+                    if not line or line.startswith("#") or line.lower().startswith("output") or line.lower().startswith("input"):
+                        continue
+
+                    # Remove timestamp markers like [00:05]
+                    if "[" in line and "]" in line:
+                        # Find last ] and take text after it
+                        bracket_end = line.rfind("]")
+                        if bracket_end != -1:
+                            line = line[bracket_end + 1:].strip()
+
+                    # Remove any number prefix if exists
+                    if ". " in line:
+                        parts = line.split(". ", 1)
+                        if parts[0].strip().isdigit():
+                            line = parts[1].strip()
+
+                    if line:
+                        translated_lines.append(line)
+
+            # Strategy 3: If still mismatched, truncate or pad
+            if len(translated_lines) < len(batch):
+                logger.warning(f"Batch {batch_num}: Still short ({len(translated_lines)}/{len(batch)}). Padding with originals.")
+                # Pad with original text for missing lines
+                while len(translated_lines) < len(batch):
+                    translated_lines.append(batch[len(translated_lines)]["text"])
+            elif len(translated_lines) > len(batch):
+                logger.warning(f"Batch {batch_num}: Too many lines ({len(translated_lines)}/{len(batch)}). Truncating.")
+                translated_lines = translated_lines[:len(batch)]
 
             # Map translations back to segments
             result = []
             for idx, seg in enumerate(batch):
-                if idx < len(translated_lines):
-                    result.append({
-                        "start": seg["start"],
-                        "end": seg["end"],
-                        "text": translated_lines[idx],
-                        "original": seg["text"]
-                    })
-                else:
-                    # Fallback if parsing fails
-                    logger.warning(f"Translation parsing issue for segment {idx+1} in batch {batch_num}")
-                    result.append(seg)
+                result.append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": translated_lines[idx],
+                    "original": seg["text"]
+                })
 
             return result
 
@@ -248,9 +293,21 @@ def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> L
     if current_batch:
         batches.append(current_batch)
 
+    # Split oversized batches (dialogue-heavy scenes)
+    final_batches = []
+    for batch in batches:
+        if len(batch) > MAX_SEGMENTS_PER_BATCH:
+            # Split into smaller batches
+            for i in range(0, len(batch), MAX_SEGMENTS_PER_BATCH):
+                final_batches.append(batch[i:i + MAX_SEGMENTS_PER_BATCH])
+        else:
+            final_batches.append(batch)
+
     logger.info(f"Starting parallel translation with {workers} workers")
     logger.info(f"Using model: {GPT_MODEL}")
-    logger.info(f"Batching: {len(batches)} batches ({TRANSLATION_BATCH_MINUTES}-minute windows)")
+    logger.info(f"Batching: {len(final_batches)} batches ({TRANSLATION_BATCH_MINUTES}-minute windows, max {MAX_SEGMENTS_PER_BATCH} segments/batch)")
+
+    batches = final_batches
 
     all_translated = []
 
