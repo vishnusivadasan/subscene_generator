@@ -276,6 +276,55 @@ def transcribe_audio_translate(chunks_generator, total_chunks: int = None, worke
     return all_segments, chunks_info
 
 
+def translate_single_line(segment: Dict[str, any], line_num: int) -> Dict[str, any]:
+    """
+    Translate a single segment using GPT-4.
+    Used as fallback when batch translation fails.
+
+    Args:
+        segment: Single segment to translate
+        line_num: Line number for logging
+
+    Returns:
+        Translated segment or original if translation fails
+    """
+    try:
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a professional subtitle translator. Translate Japanese subtitle lines to natural English. "
+                               "Preserve conversational flow, tone, nuance, and emotion. "
+                               "Do NOT censor or soften meaning - translate all content directly."
+                },
+                {
+                    "role": "user",
+                    "content": f"Translate this Japanese subtitle to English:\n\n{segment['text']}"
+                }
+            ],
+            temperature=0.3,
+            max_tokens=200
+        )
+
+        translated_text = response.choices[0].message.content.strip()
+
+        if translated_text:
+            return {
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": translated_text,
+                "original": segment["text"]
+            }
+        else:
+            logger.warning(f"Line {line_num}: Empty response, using original")
+            return segment
+
+    except Exception as e:
+        logger.warning(f"Line {line_num}: Individual translation failed ({str(e)}), using original")
+        return segment
+
+
 def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[str, any]]:
     """
     Translate a batch of segments using GPT-4 with full context.
@@ -348,9 +397,18 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
                     time.sleep(backoff_times[attempt])
                     continue
                 else:
-                    logger.error(f"Batch {batch_num}: GPT-4 returned empty response after {max_retries} attempts. Using originals.")
+                    logger.error(f"Batch {batch_num}: GPT-4 returned empty response after {max_retries} attempts.")
                     logger.error(f"Batch {batch_num} final response: {response_preview}")
-                    return batch
+                    logger.info(f"Batch {batch_num}: Attempting line-by-line translation fallback for {len(batch)} segments...")
+
+                    # Try translating each line individually
+                    result = []
+                    for idx, seg in enumerate(batch, 1):
+                        translated_seg = translate_single_line(seg, idx)
+                        result.append(translated_seg)
+
+                    logger.info(f"Batch {batch_num}: Line-by-line fallback complete")
+                    return result
 
             # Multi-strategy parsing with fallbacks
             translated_lines = []
@@ -425,8 +483,17 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
                 logger.warning(f"Batch {batch_num} attempt {attempt + 1}: Exception occurred: {e}. Retrying...")
                 time.sleep(backoff_times[attempt])
             else:
-                logger.error(f"Batch {batch_num}: Translation failed after {max_retries} attempts: {e}. Using originals.")
-                return batch
+                logger.error(f"Batch {batch_num}: Translation failed after {max_retries} attempts: {e}")
+                logger.info(f"Batch {batch_num}: Attempting line-by-line translation fallback for {len(batch)} segments...")
+
+                # Try translating each line individually
+                result = []
+                for idx, seg in enumerate(batch, 1):
+                    translated_seg = translate_single_line(seg, idx)
+                    result.append(translated_seg)
+
+                logger.info(f"Batch {batch_num}: Line-by-line fallback complete")
+                return result
 
     return batch
 
