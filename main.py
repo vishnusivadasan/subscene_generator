@@ -14,7 +14,7 @@ from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
 from src.transcribe import transcribe_audio, transcribe_audio_translate, translate_segments, correct_translations
 from src.merge_srt import save_subtitles, save_japanese_srt, load_japanese_srt
-from config import ENABLE_CORRECTION, BULK_TRANSLATOR, FALLBACK_CHAIN
+from config import ENABLE_CORRECTION, BULK_TRANSLATOR, FALLBACK_CHAIN, LOCAL_WHISPER_MODEL, LOCAL_WHISPER_DEVICE, OPENAI_API_KEY
 
 
 def main():
@@ -84,6 +84,28 @@ Examples:
         help="Comma-separated fallback chain for failed translations (e.g., 'google,openai,untranslated'). Overrides FALLBACK_CHAIN from config."
     )
 
+    parser.add_argument(
+        "--local-whisper",
+        action="store_true",
+        help="Use local faster-whisper model instead of OpenAI API (no API costs, requires GPU/CPU)"
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["tiny", "base", "small", "medium", "large-v3"],
+        default=None,
+        help="Whisper model size for local transcription (default: medium). Only used with --local-whisper."
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cuda", "cpu"],
+        default=None,
+        help="Device for local Whisper model (default: auto). Only used with --local-whisper."
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -95,6 +117,19 @@ Examples:
 
         video_path = validate_video_path(args.video_path)
         logger.info(f"Input video: {video_path}")
+
+        # Determine local whisper settings
+        use_local_whisper = args.local_whisper
+        whisper_model = args.model if args.model else LOCAL_WHISPER_MODEL
+        whisper_device = args.device if args.device else LOCAL_WHISPER_DEVICE
+
+        # Check if OpenAI API key is required
+        if not use_local_whisper and not OPENAI_API_KEY:
+            logger.error("OPENAI_API_KEY not found. Use --local-whisper for offline transcription or set the API key in .env")
+            sys.exit(1)
+
+        if use_local_whisper:
+            logger.info(f"Using local Whisper: model={whisper_model}, device={whisper_device}")
 
         # Determine if correction should be enabled
         enable_correction = ENABLE_CORRECTION
@@ -115,9 +150,13 @@ Examples:
         fallback_chain = args.fallback_chain.split(',') if args.fallback_chain else FALLBACK_CHAIN
 
         # Determine total steps
-        if args.direct_whisper:
+        if args.direct_whisper or (use_local_whisper and args.direct_whisper):
             # Direct whisper: extract + translate = 2 steps
             total_steps = 2
+        elif use_local_whisper:
+            # Local whisper: extract + transcribe + translate (+ optional correction)
+            # No chunking step needed for local whisper
+            total_steps = 4 if enable_correction else 3
         else:
             # Normal mode: extract + transcribe + translate (+ optional correction)
             total_steps = 4 if enable_correction else 3
@@ -136,20 +175,42 @@ Examples:
             logger.info(f"\n[1/{total_steps}] Extracting audio...")
             audio_path = extract_audio(video_path)
 
-            # Step 2: Concurrent chunking and transcription/translation
-            if args.direct_whisper:
-                # Direct Whisper translation (no GPT-4 needed)
-                logger.info(f"\n[2/{total_steps}] Chunking and translating to English with Whisper (concurrent processing)...")
+            # Step 2: Transcription/translation
+            if use_local_whisper:
+                # Local Whisper transcription (no chunking needed)
+                from src.transcribe_local import transcribe_audio_local, transcribe_audio_local_translate
+
+                if args.direct_whisper:
+                    # Direct translation to English
+                    logger.info(f"\n[2/{total_steps}] Transcribing and translating with local Whisper ({whisper_model})...")
+                    segments, _ = transcribe_audio_local_translate(
+                        audio_path,
+                        model_size=whisper_model,
+                        device=whisper_device
+                    )
+                else:
+                    # Transcribe to Japanese first
+                    logger.info(f"\n[2/{total_steps}] Transcribing with local Whisper ({whisper_model})...")
+                    segments, _ = transcribe_audio_local(
+                        audio_path,
+                        model_size=whisper_model,
+                        device=whisper_device
+                    )
+                chunks_info = None  # No chunks to clean up
+            elif args.direct_whisper:
+                # Direct Whisper API translation (no GPT-4 needed)
+                logger.info(f"\n[2/{total_steps}] Chunking and translating to English with Whisper API (concurrent processing)...")
                 chunks_generator = chunk_audio(audio_path)
                 segments, chunks_info = transcribe_audio_translate(chunks_generator, workers=args.workers)
             else:
-                # Normal mode: Transcribe to Japanese first
+                # Normal API mode: Transcribe to Japanese first
                 logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio (concurrent processing)...")
                 chunks_generator = chunk_audio(audio_path)
                 segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
 
-            # Clean up chunk files
-            cleanup_chunks(chunks_info)
+            # Clean up chunk files (if any)
+            if chunks_info:
+                cleanup_chunks(chunks_info)
 
             # Check if we got any segments
             if not segments:

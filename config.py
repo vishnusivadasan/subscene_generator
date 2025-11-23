@@ -15,13 +15,8 @@ load_dotenv()
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Get OpenAI API key
+# Get OpenAI API key (optional if using local whisper only)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError(
-        "OPENAI_API_KEY not found in environment. "
-        "Please add it to your .env file."
-    )
 
 # Get worker count (default to 4 if not specified)
 WORKERS = int(os.getenv("WORKERS", "4"))
@@ -41,8 +36,8 @@ BULK_TRANSLATOR = os.getenv("BULK_TRANSLATOR", "google")  # "openai" or "google"
 FALLBACK_CHAIN = os.getenv("FALLBACK_CHAIN", "google,openai,untranslated").split(",")  # Fallback order
 GOOGLE_BUNDLE_SIZE = int(os.getenv("GOOGLE_BUNDLE_SIZE", "100"))  # Lines per Google API call
 
-# Create singleton OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Create singleton OpenAI client (only if API key is available)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Audio chunk duration in milliseconds (80 seconds)
 CHUNK_DURATION_MS = 80000
@@ -53,3 +48,7 @@ AUDIO_SETTINGS = {
     "channels": 1,          # mono
     "codec": "pcm_s16le"    # PCM 16-bit
 }
+
+# Local Whisper settings (faster-whisper)
+LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "medium")  # tiny, base, small, medium, large-v3
+LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")  # auto, cuda, cpu
