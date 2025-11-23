@@ -13,7 +13,7 @@ from utils import validate_video_path, logger, cleanup_files
 from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
 from src.transcribe import transcribe_audio, translate_segments, correct_translations
-from src.merge_srt import save_subtitles
+from src.merge_srt import save_subtitles, save_japanese_srt, load_japanese_srt
 from config import ENABLE_CORRECTION
 
 
@@ -57,6 +57,12 @@ Examples:
         help="Enable GPT-4 correction step (overrides .env setting)"
     )
 
+    parser.add_argument(
+        "--force-transcribe",
+        action="store_true",
+        help="Force re-transcription even if cached Japanese subtitles exist"
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -79,22 +85,37 @@ Examples:
         # Determine total steps (combined chunking+transcription into one step)
         total_steps = 4 if enable_correction else 3
 
-        # Step 1: Extract audio
-        logger.info(f"\n[1/{total_steps}] Extracting audio...")
-        audio_path = extract_audio(video_path)
+        # Check for cached Japanese subtitles (skip transcription if found)
+        segments = None
+        if not args.force_transcribe:
+            segments = load_japanese_srt(video_path)
 
-        # Step 2: Concurrent chunking and transcription
-        logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio (concurrent processing)...")
-        chunks_generator = chunk_audio(audio_path)
-        segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
+        if segments:
+            logger.info("Using cached Japanese subtitles (skip transcription)")
+            logger.info("Use --force-transcribe to re-transcribe from audio")
+        else:
+            # Step 1: Extract audio
+            logger.info(f"\n[1/{total_steps}] Extracting audio...")
+            audio_path = extract_audio(video_path)
 
-        # Clean up chunk files
-        cleanup_chunks(chunks_info)
+            # Step 2: Concurrent chunking and transcription
+            logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio (concurrent processing)...")
+            chunks_generator = chunk_audio(audio_path)
+            segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
 
-        # Check if we got any segments
-        if not segments:
-            logger.error("No transcription segments were generated. Cannot create subtitle file.")
-            sys.exit(1)
+            # Clean up chunk files
+            cleanup_chunks(chunks_info)
+
+            # Check if we got any segments
+            if not segments:
+                logger.error("No transcription segments were generated. Cannot create subtitle file.")
+                sys.exit(1)
+
+            # Save Japanese subtitles for future use
+            save_japanese_srt(segments, video_path)
+
+            # Clean up extracted audio file
+            cleanup_files(audio_path)
 
         # Step 3: Translate to English using GPT-4
         logger.info(f"\n[3/{total_steps}] Translating to English with GPT-4...")
@@ -108,9 +129,6 @@ Examples:
         # Final step: Save subtitles
         logger.info(f"\n[{total_steps}/{total_steps}] Generating subtitle file...")
         srt_path = save_subtitles(segments, video_path)
-
-        # Clean up extracted audio file
-        cleanup_files(audio_path)
 
         # Success!
         logger.info("\n" + "=" * 60)
