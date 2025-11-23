@@ -4,11 +4,16 @@ Loads environment variables and creates OpenAI client singleton.
 """
 
 import os
+import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Suppress verbose HTTP request logs from OpenAI/httpx (only show warnings/errors)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Get OpenAI API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

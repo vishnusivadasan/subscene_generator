@@ -25,8 +25,6 @@ def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
     chunk_path = chunk_info["chunk_path"]
     offset_seconds = chunk_info["offset_seconds"]
 
-    logger.info(f"[Worker] Processing chunk offset {offset_seconds:.2f}s")
-
     max_retries = 3
     backoff_times = [1, 2, 4]  # Exponential backoff: 1s, 2s, 4s
 
@@ -52,7 +50,6 @@ def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
                         "text": seg.text.strip()
                     })
 
-            logger.info(f"[Worker] Completed chunk offset {offset_seconds:.2f}s")
             return segments
 
         except Exception as e:
