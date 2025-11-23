@@ -5,6 +5,7 @@ Automatically generate English subtitles from video files using OpenAI's Whisper
 ## Features
 
 ✅ **Parallel Processing** - Process multiple audio chunks simultaneously (default 4 workers)
+✅ **Progress Bars** - Real-time progress indicators for each processing step
 ✅ **Automatic Translation** - Detects source language and translates to English
 ✅ **Robust Error Handling** - Retry logic with exponential backoff for API failures
 ✅ **Multi-hour Video Support** - Handles videos of any length
@@ -113,19 +114,16 @@ Whisper Subtitle Generator
 
 [2/4] Chunking audio...
 [INFO] Audio duration: 180.50 seconds
+Creating chunks: 100%|██████████| 3/3 [00:00<00:00, 3.75chunk/s]
 [INFO] Total chunks created: 3
 
 [3/4] Transcribing audio (this may take a while)...
 [INFO] Starting parallel transcription with 4 workers
-[Worker] Processing chunk offset 0.00s
-[Worker] Processing chunk offset 80.00s
-[Worker] Processing chunk offset 160.00s
-[Worker] Completed chunk offset 0.00s
-[Worker] Completed chunk offset 80.00s
-[Worker] Completed chunk offset 160.00s
+Transcribing: 100%|██████████| 3/3 [00:09<00:00, 3.27s/chunk]
 [INFO] Transcription complete. Total segments: 42
 
 [4/4] Generating subtitle file...
+Writing SRT: 100%|██████████| 42/42 [00:00<00:00]
 [INFO] SRT file created successfully: /path/to/test_file.srt
 
 ============================================================

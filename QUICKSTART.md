@@ -55,10 +55,21 @@ Output: /path/to/movie.srt
 
 ## What Happens During Processing
 
+You'll see real-time progress bars for each step:
+
 1. **Extracting audio** - Converts video to WAV format (~10-30 sec)
-2. **Chunking audio** - Splits into 80-second segments (~5-10 sec)
-3. **Transcribing** - Parallel API calls to Whisper (~3-8 min per hour of video)
-4. **Generating SRT** - Formats and saves subtitle file (<1 sec)
+2. **Chunking audio** - Splits into 80-second segments with progress bar
+   ```
+   Creating chunks: 100%|██████████| 10/10 [00:03<00:00]
+   ```
+3. **Transcribing** - Parallel API calls to Whisper with progress tracking
+   ```
+   Transcribing: 100%|██████████| 10/10 [01:23<00:00, 8.35s/chunk]
+   ```
+4. **Generating SRT** - Formats and saves subtitle file
+   ```
+   Writing SRT: 100%|██████████| 152/152 [00:00<00:00]
+   ```
 
 ## Troubleshooting
 

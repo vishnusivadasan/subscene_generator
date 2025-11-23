@@ -5,6 +5,7 @@ Splits audio files into chunks for parallel processing.
 
 import subprocess
 from typing import List, Dict
+from tqdm import tqdm
 from utils import logger, ensure_directory
 from config import CHUNK_DURATION_MS
 
@@ -63,50 +64,51 @@ def chunk_audio(audio_path: str) -> List[Dict[str, any]]:
 
     chunks_info = []
     chunk_duration_sec = CHUNK_DURATION_MS / 1000.0
+
+    # Calculate total number of chunks
+    total_chunks = int((total_duration_sec + chunk_duration_sec - 1) // chunk_duration_sec)
+
     chunk_start_sec = 0.0
-    chunk_number = 0
 
-    # Split audio into chunks using ffmpeg
-    while chunk_start_sec < total_duration_sec:
-        # Calculate chunk duration (or use remaining audio if less than chunk size)
-        current_chunk_duration = min(chunk_duration_sec, total_duration_sec - chunk_start_sec)
+    # Split audio into chunks using ffmpeg with progress bar
+    with tqdm(total=total_chunks, desc="Creating chunks", unit="chunk") as pbar:
+        chunk_number = 0
+        while chunk_start_sec < total_duration_sec:
+            # Calculate chunk duration (or use remaining audio if less than chunk size)
+            current_chunk_duration = min(chunk_duration_sec, total_duration_sec - chunk_start_sec)
 
-        # Create chunk filename
-        chunk_path = f"audio/chunk_{int(chunk_start_sec * 1000)}.wav"
+            # Create chunk filename
+            chunk_path = f"audio/chunk_{int(chunk_start_sec * 1000)}.wav"
 
-        # Use ffmpeg to extract chunk with re-encoding to ensure compatibility
-        command = [
-            "ffmpeg",
-            "-i", audio_path,
-            "-ss", str(chunk_start_sec),
-            "-t", str(current_chunk_duration),
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            chunk_path,
-            "-y"
-        ]
+            # Use ffmpeg to extract chunk with re-encoding to ensure compatibility
+            command = [
+                "ffmpeg",
+                "-i", audio_path,
+                "-ss", str(chunk_start_sec),
+                "-t", str(current_chunk_duration),
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                chunk_path,
+                "-y"
+            ]
 
-        subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True
-        )
+            subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
 
-        # Add chunk info
-        chunks_info.append({
-            "chunk_path": chunk_path,
-            "offset_seconds": chunk_start_sec
-        })
+            # Add chunk info
+            chunks_info.append({
+                "chunk_path": chunk_path,
+                "offset_seconds": chunk_start_sec
+            })
 
-        logger.info(
-            f"Created chunk {chunk_number + 1}: "
-            f"{chunk_path} (offset: {chunk_start_sec:.2f}s)"
-        )
-
-        chunk_number += 1
-        chunk_start_sec += chunk_duration_sec
+            chunk_number += 1
+            chunk_start_sec += chunk_duration_sec
+            pbar.update(1)
 
     logger.info(f"Total chunks created: {len(chunks_info)}")
 

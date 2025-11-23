@@ -6,6 +6,7 @@ Handles concurrent API calls with retry logic and rate limit handling.
 import time
 from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 from utils import logger
 from config import client, WORKERS
 
@@ -111,17 +112,19 @@ def transcribe_audio(chunks_info: List[Dict[str, any]], workers: int = None) -> 
             for chunk in chunks_info
         }
 
-        # Collect results as they complete
-        for future in as_completed(future_to_chunk):
-            chunk = future_to_chunk[future]
-            try:
-                segments = future.result()
-                all_segments.extend(segments)
-            except Exception as e:
-                logger.error(
-                    f"Unexpected error processing chunk "
-                    f"{chunk['chunk_path']}: {e}"
-                )
+        # Collect results as they complete with progress bar
+        with tqdm(total=len(chunks_info), desc="Transcribing", unit="chunk") as pbar:
+            for future in as_completed(future_to_chunk):
+                chunk = future_to_chunk[future]
+                try:
+                    segments = future.result()
+                    all_segments.extend(segments)
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected error processing chunk "
+                        f"{chunk['chunk_path']}: {e}"
+                    )
+                pbar.update(1)
 
     # Sort all segments by start time
     all_segments.sort(key=lambda x: x["start"])
