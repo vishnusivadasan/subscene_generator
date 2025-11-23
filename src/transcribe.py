@@ -81,12 +81,14 @@ def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
     return []
 
 
-def transcribe_audio(chunks_info: List[Dict[str, any]], workers: int = None) -> List[Dict[str, any]]:
+def transcribe_audio(chunks_generator, total_chunks: int = None, workers: int = None) -> List[Dict[str, any]]:
     """
     Transcribe audio chunks in parallel using ThreadPoolExecutor.
+    Accepts chunks from a generator and starts transcription immediately.
 
     Args:
-        chunks_info: List of chunk information dictionaries
+        chunks_generator: Generator that yields chunk information dictionaries
+        total_chunks: Total number of chunks for progress tracking (optional)
         workers: Number of parallel workers (overrides config if provided)
 
     Returns:
@@ -96,39 +98,50 @@ def transcribe_audio(chunks_info: List[Dict[str, any]], workers: int = None) -> 
     if workers is None:
         workers = WORKERS
 
-    logger.info(f"Starting parallel transcription with {workers} workers")
-    logger.info(f"Total chunks to process: {len(chunks_info)}")
+    logger.info(f"Starting concurrent chunking and transcription with {workers} workers")
 
     all_segments = []
+    chunks_info = []  # Keep track of chunks for cleanup
 
     # Use ThreadPoolExecutor for parallel processing
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        # Submit all chunks for processing
-        future_to_chunk = {
-            executor.submit(process_chunk, chunk): chunk
-            for chunk in chunks_info
-        }
+        future_to_chunk = {}
 
-        # Collect results as they complete with progress bar
-        with tqdm(total=len(chunks_info), desc="Transcribing", unit="chunk") as pbar:
-            for future in as_completed(future_to_chunk):
-                chunk = future_to_chunk[future]
-                try:
-                    segments = future.result()
-                    all_segments.extend(segments)
-                except Exception as e:
-                    logger.error(
-                        f"Unexpected error processing chunk "
-                        f"{chunk['chunk_path']}: {e}"
-                    )
-                pbar.update(1)
+        # Progress bar (update total as chunks arrive if not provided)
+        pbar = tqdm(desc="Transcribing", unit="chunk", total=total_chunks)
+
+        # Submit chunks as they arrive from generator
+        for chunk in chunks_generator:
+            chunks_info.append(chunk)
+            future = executor.submit(process_chunk, chunk)
+            future_to_chunk[future] = chunk
+
+            # Update total if we didn't know it upfront
+            if total_chunks is None:
+                pbar.total = len(chunks_info)
+                pbar.refresh()
+
+        # All chunks submitted, now collect results as they complete
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                segments = future.result()
+                all_segments.extend(segments)
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error processing chunk "
+                    f"{chunk['chunk_path']}: {e}"
+                )
+            pbar.update(1)
+
+        pbar.close()
 
     # Sort all segments by start time
     all_segments.sort(key=lambda x: x["start"])
 
     logger.info(f"Transcription complete. Total segments: {len(all_segments)}")
 
-    return all_segments
+    return all_segments, chunks_info
 
 
 def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[str, any]]:
@@ -154,6 +167,8 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
 
     batch_input = "\n".join(batch_text)
 
+    logger.debug(f"Batch {batch_num}: Translating {len(batch)} segments")
+
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
@@ -168,7 +183,8 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
                                    "3. Do NOT skip any numbers\n"
                                    "4. Do NOT add commentary or explanations\n"
                                    "5. Preserve conversational flow, tone, nuance, and emotion\n"
-                                   "6. Do NOT censor or soften meaning\n\n"
+                                   "6. Do NOT censor or soften meaning - translate all sexual, vulgar, and explicit language directly\n"
+                                   "7. Do NOT use euphemisms - preserve crude/vulgar terms exactly as they appear in context\n\n"
                                    "Example format:\n"
                                    "Input:\n"
                                    "1. [00:05] こんにちは\n"
@@ -188,6 +204,16 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
 
             translated_text = response.choices[0].message.content.strip()
 
+            # Check if response is empty or too short
+            if not translated_text or len(translated_text) < 10:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Batch {batch_num} attempt {attempt + 1}: GPT-4 returned empty/short response. Retrying...")
+                    time.sleep(backoff_times[attempt])
+                    continue
+                else:
+                    logger.error(f"Batch {batch_num}: GPT-4 returned empty response after {max_retries} attempts. Using originals.")
+                    return batch
+
             # Multi-strategy parsing with fallbacks
             translated_lines = []
 
@@ -202,7 +228,9 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
 
             # Strategy 2: If count mismatch, try aggressive line extraction
             if len(translated_lines) != len(batch):
-                logger.warning(f"Batch {batch_num}: Expected {len(batch)} lines, got {len(translated_lines)}. Using fallback parsing.")
+                logger.warning(f"Batch {batch_num} attempt {attempt + 1}: Expected {len(batch)} lines, got {len(translated_lines)}. Using fallback parsing.")
+                logger.debug(f"Batch {batch_num} raw response preview: {translated_text[:500]}...")
+
                 translated_lines = []
                 for line in translated_text.split("\n"):
                     line = line.strip()
@@ -226,7 +254,13 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
                     if line:
                         translated_lines.append(line)
 
-            # Strategy 3: If still mismatched, truncate or pad
+            # Strategy 3: If still severely mismatched and we have retries left, retry
+            if len(translated_lines) < len(batch) * 0.5 and attempt < max_retries - 1:
+                logger.warning(f"Batch {batch_num} attempt {attempt + 1}: Only got {len(translated_lines)}/{len(batch)} lines (< 50%). Retrying...")
+                time.sleep(backoff_times[attempt])
+                continue
+
+            # Strategy 4: Truncate or pad if minor mismatch
             if len(translated_lines) < len(batch):
                 logger.warning(f"Batch {batch_num}: Still short ({len(translated_lines)}/{len(batch)}). Padding with originals.")
                 # Pad with original text for missing lines
@@ -250,9 +284,10 @@ def translate_batch(batch: List[Dict[str, any]], batch_num: int) -> List[Dict[st
 
         except Exception as e:
             if attempt < max_retries - 1:
+                logger.warning(f"Batch {batch_num} attempt {attempt + 1}: Exception occurred: {e}. Retrying...")
                 time.sleep(backoff_times[attempt])
             else:
-                logger.error(f"Translation failed for batch {batch_num}, using originals: {e}")
+                logger.error(f"Batch {batch_num}: Translation failed after {max_retries} attempts: {e}. Using originals.")
                 return batch
 
     return batch
@@ -386,7 +421,9 @@ def correct_translations(segments: List[Dict[str, any]]) -> List[Dict[str, any]]
                                    "so they are natural, accurate, and preserve the emotional meaning of the original Japanese. "
                                    "Fix mistranslations, unnatural phrasing, and missing nuance. "
                                    "Maintain conversational flow and context between lines. "
-                                   "Do not censor content. Return ONLY the corrected lines in the same numbered format."
+                                   "Do NOT censor content - preserve all sexual, vulgar, and explicit language exactly. "
+                                   "Do NOT soften crude or vulgar terms - maintain them as-is. "
+                                   "Return ONLY the corrected lines in the same numbered format."
                     },
                     {
                         "role": "user",

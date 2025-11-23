@@ -76,20 +76,17 @@ Examples:
         elif args.no_correction:
             enable_correction = False
 
-        # Determine total steps
-        total_steps = 5 if enable_correction else 4
+        # Determine total steps (combined chunking+transcription into one step)
+        total_steps = 4 if enable_correction else 3
 
         # Step 1: Extract audio
         logger.info(f"\n[1/{total_steps}] Extracting audio...")
         audio_path = extract_audio(video_path)
 
-        # Step 2: Chunk audio
-        logger.info(f"\n[2/{total_steps}] Chunking audio...")
-        chunks_info = chunk_audio(audio_path)
-
-        # Step 3: Transcribe chunks in parallel (original language)
-        logger.info(f"\n[3/{total_steps}] Transcribing audio (this may take a while)...")
-        segments = transcribe_audio(chunks_info, workers=args.workers)
+        # Step 2: Concurrent chunking and transcription
+        logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio (concurrent processing)...")
+        chunks_generator = chunk_audio(audio_path)
+        segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
 
         # Clean up chunk files
         cleanup_chunks(chunks_info)
@@ -99,20 +96,17 @@ Examples:
             logger.error("No transcription segments were generated. Cannot create subtitle file.")
             sys.exit(1)
 
-        # Step 4: Translate to English using GPT-4
-        step_num = 4
-        logger.info(f"\n[{step_num}/{total_steps}] Translating to English with GPT-4...")
+        # Step 3: Translate to English using GPT-4
+        logger.info(f"\n[3/{total_steps}] Translating to English with GPT-4...")
         segments = translate_segments(segments, workers=args.workers)
 
-        # Step 5 (optional): Correct translations
+        # Step 4 (optional): Correct translations
         if enable_correction:
-            step_num += 1
-            logger.info(f"\n[{step_num}/{total_steps}] Correcting translations with GPT-4...")
+            logger.info(f"\n[4/{total_steps}] Correcting translations with GPT-4...")
             segments = correct_translations(segments)
 
         # Final step: Save subtitles
-        step_num += 1
-        logger.info(f"\n[{step_num}/{total_steps}] Generating subtitle file...")
+        logger.info(f"\n[{total_steps}/{total_steps}] Generating subtitle file...")
         srt_path = save_subtitles(segments, video_path)
 
         # Clean up extracted audio file
