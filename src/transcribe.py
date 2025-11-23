@@ -8,7 +8,7 @@ from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from utils import logger
-from config import client, WORKERS, GPT_MODEL, ENABLE_CORRECTION, TRANSLATION_BATCH_MINUTES, MAX_SEGMENTS_PER_BATCH
+from config import client, WORKERS, TRANSLATION_WORKERS, GPT_MODEL, ENABLE_CORRECTION, TRANSLATION_BATCH_MINUTES, MAX_SEGMENTS_PER_BATCH
 
 
 def process_chunk(chunk_info: Dict[str, any]) -> List[Dict[str, any]]:
@@ -305,7 +305,7 @@ def translate_segments(segments: List[Dict[str, any]], workers: int = None) -> L
         List of segments with translated English text
     """
     if workers is None:
-        workers = WORKERS
+        workers = TRANSLATION_WORKERS
 
     # Create time-based batches
     batch_window_seconds = TRANSLATION_BATCH_MINUTES * 60

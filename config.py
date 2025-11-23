@@ -26,6 +26,10 @@ if not OPENAI_API_KEY:
 # Get worker count (default to 4 if not specified)
 WORKERS = int(os.getenv("WORKERS", "4"))
 
+# Translation worker count (separate from transcription workers)
+# Lower to avoid GPT-4 rate limits
+TRANSLATION_WORKERS = int(os.getenv("TRANSLATION_WORKERS", "4"))
+
 # GPT translation settings
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")  # Use gpt-4o for best quality
 ENABLE_CORRECTION = os.getenv("ENABLE_CORRECTION", "false").lower() == "true"

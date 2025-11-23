@@ -42,7 +42,7 @@ Examples:
         "-w", "--workers",
         type=int,
         default=None,
-        help="Number of parallel workers for transcription (default: from config or 4)"
+        help="Number of parallel workers for transcription only (default: from config or 4). Translation uses TRANSLATION_WORKERS from config."
     )
 
     parser.add_argument(
@@ -98,7 +98,7 @@ Examples:
 
         # Step 3: Translate to English using GPT-4
         logger.info(f"\n[3/{total_steps}] Translating to English with GPT-4...")
-        segments = translate_segments(segments, workers=args.workers)
+        segments = translate_segments(segments)  # Uses TRANSLATION_WORKERS from config
 
         # Step 4 (optional): Correct translations
         if enable_correction:
