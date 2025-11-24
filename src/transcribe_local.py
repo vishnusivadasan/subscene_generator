@@ -6,6 +6,8 @@ Provides offline transcription without API costs.
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 from tqdm import tqdm
+from faster_whisper.vad import VadOptions
+from faster_whisper.audio import decode_audio
 from utils import logger
 
 
@@ -84,14 +86,19 @@ def detect_language(
 
     logger.info("Detecting language using VAD-based speech detection...")
 
+    # Load audio as numpy array (16kHz mono)
+    audio = decode_audio(audio_path, sampling_rate=16000)
+
     # Use VAD filter and multiple segments for robust detection
     # language_detection_segments=4 samples from different parts of the audio
+    vad_options = VadOptions(
+        threshold=0.5,
+        min_silence_duration_ms=500,
+    )
     language, probability, all_probs = model.detect_language(
-        audio_path,
+        audio,
         vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-        ),
+        vad_parameters=vad_options,
         language_detection_segments=4,  # Sample from multiple segments
         language_detection_threshold=0.5,
     )
