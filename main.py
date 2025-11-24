@@ -106,6 +106,19 @@ Examples:
         help="Device for local Whisper model (default: auto). Only used with --local-whisper."
     )
 
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        help="Beam size for local Whisper decoding (default: 5). Higher values may improve accuracy but are slower. Only used with --local-whisper."
+    )
+
+    parser.add_argument(
+        "--skip-language-check",
+        action="store_true",
+        help="Skip Japanese language detection check before transcription. Only used with --local-whisper."
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -129,7 +142,7 @@ Examples:
             sys.exit(1)
 
         if use_local_whisper:
-            logger.info(f"Using local Whisper: model={whisper_model}, device={whisper_device}")
+            logger.info(f"Using local Whisper: model={whisper_model}, device={whisper_device}, beam_size={args.beam_size}")
 
         # Determine if correction should be enabled
         enable_correction = ENABLE_CORRECTION
@@ -178,7 +191,11 @@ Examples:
             # Step 2: Transcription/translation
             if use_local_whisper:
                 # Local Whisper transcription (no chunking needed)
-                from src.transcribe_local import transcribe_audio_local, transcribe_audio_local_translate
+                from src.transcribe_local import (
+                    transcribe_audio_local,
+                    transcribe_audio_local_translate,
+                    LanguageDetectionError
+                )
 
                 if args.direct_whisper:
                     # Direct translation to English
@@ -186,7 +203,9 @@ Examples:
                     segments, _ = transcribe_audio_local_translate(
                         audio_path,
                         model_size=whisper_model,
-                        device=whisper_device
+                        device=whisper_device,
+                        beam_size=args.beam_size,
+                        skip_language_check=args.skip_language_check
                     )
                 else:
                     # Transcribe to Japanese first
@@ -194,7 +213,9 @@ Examples:
                     segments, _ = transcribe_audio_local(
                         audio_path,
                         model_size=whisper_model,
-                        device=whisper_device
+                        device=whisper_device,
+                        beam_size=args.beam_size,
+                        skip_language_check=args.skip_language_check
                     )
                 chunks_info = None  # No chunks to clean up
             elif args.direct_whisper:
