@@ -9,12 +9,271 @@ import argparse
 import sys
 from pathlib import Path
 
-from utils import validate_video_path, logger, cleanup_files
+from utils import validate_video_path, validate_input_path, find_video_files, has_existing_srt, logger, cleanup_files
 from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
 from src.transcribe import transcribe_audio, transcribe_audio_translate, translate_segments, correct_translations
 from src.merge_srt import save_subtitles, save_japanese_srt, load_japanese_srt
 from config import ENABLE_CORRECTION, BULK_TRANSLATOR, FALLBACK_CHAIN, LOCAL_WHISPER_MODEL, LOCAL_WHISPER_DEVICE, OPENAI_API_KEY
+
+
+def process_single_video(
+    video_path: Path,
+    args,
+    use_local_whisper: bool,
+    whisper_model: str,
+    whisper_device: str,
+    enable_correction: bool,
+    bulk_translator: str,
+    fallback_chain: list
+) -> bool:
+    """
+    Process a single video file to generate subtitles.
+
+    Args:
+        video_path: Path to the video file
+        args: Parsed command line arguments
+        use_local_whisper: Whether to use local Whisper model
+        whisper_model: Whisper model size
+        whisper_device: Device for local Whisper
+        enable_correction: Whether to enable GPT-4 correction
+        bulk_translator: Bulk translation method
+        fallback_chain: Fallback chain for translation
+
+    Returns:
+        True on success, False on failure
+    """
+    try:
+        logger.info(f"Processing: {video_path}")
+
+        # Determine total steps
+        if args.direct_whisper or (use_local_whisper and args.direct_whisper):
+            total_steps = 2
+        elif use_local_whisper:
+            total_steps = 4 if enable_correction else 3
+        else:
+            total_steps = 4 if enable_correction else 3
+
+        # Check for cached Japanese subtitles
+        segments = None
+        if not args.force_transcribe and not args.direct_whisper:
+            segments = load_japanese_srt(video_path)
+
+        if segments:
+            logger.info("Using cached Japanese subtitles (skip transcription)")
+        else:
+            # Step 1: Extract audio
+            logger.info(f"\n[1/{total_steps}] Extracting audio...")
+            audio_path = extract_audio(video_path)
+
+            # Step 2: Transcription/translation
+            if use_local_whisper:
+                from src.transcribe_local import (
+                    transcribe_audio_local,
+                    transcribe_audio_local_translate,
+                    LanguageDetectionError
+                )
+
+                if args.direct_whisper:
+                    logger.info(f"\n[2/{total_steps}] Transcribing and translating with local Whisper ({whisper_model})...")
+                    segments, _ = transcribe_audio_local_translate(
+                        audio_path,
+                        model_size=whisper_model,
+                        device=whisper_device,
+                        beam_size=args.beam_size,
+                        skip_language_check=args.skip_language_check
+                    )
+                else:
+                    logger.info(f"\n[2/{total_steps}] Transcribing with local Whisper ({whisper_model})...")
+                    segments, _ = transcribe_audio_local(
+                        audio_path,
+                        model_size=whisper_model,
+                        device=whisper_device,
+                        beam_size=args.beam_size,
+                        skip_language_check=args.skip_language_check
+                    )
+                chunks_info = None
+            elif args.direct_whisper:
+                logger.info(f"\n[2/{total_steps}] Chunking and translating to English with Whisper API...")
+                chunks_generator = chunk_audio(audio_path)
+                segments, chunks_info = transcribe_audio_translate(chunks_generator, workers=args.workers)
+            else:
+                logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio...")
+                chunks_generator = chunk_audio(audio_path)
+                segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
+
+            # Clean up chunk files
+            if chunks_info:
+                cleanup_chunks(chunks_info)
+
+            if not segments:
+                logger.error("No transcription segments were generated.")
+                return False
+
+            # Save Japanese subtitles for future use
+            if not args.direct_whisper:
+                save_japanese_srt(segments, video_path)
+
+            # Clean up extracted audio file
+            cleanup_files(audio_path)
+
+        # Step 3: Translate to English
+        if not args.direct_whisper:
+            translator_name = bulk_translator.upper()
+            logger.info(f"\n[3/{total_steps}] Translating to English with {translator_name}...")
+            logger.info(f"Fallback chain: {' → '.join(fallback_chain)}")
+            segments = translate_segments(segments, bulk_translator=bulk_translator, fallback_chain=fallback_chain)
+
+        # Step 4 (optional): Correct translations
+        if enable_correction and not args.direct_whisper:
+            logger.info(f"\n[4/{total_steps}] Correcting translations with GPT-4...")
+            segments = correct_translations(segments)
+
+        # Final step: Save subtitles
+        logger.info(f"\n[{total_steps}/{total_steps}] Generating subtitle file...")
+        srt_path = save_subtitles(segments, video_path)
+
+        logger.info(f"SUCCESS! Subtitle created: {srt_path}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to process {video_path}: {e}")
+        return False
+
+
+def process_folder(
+    folder_path: Path,
+    args,
+    use_local_whisper: bool,
+    whisper_model: str,
+    whisper_device: str,
+    enable_correction: bool,
+    bulk_translator: str,
+    fallback_chain: list
+) -> None:
+    """
+    Process all video files in a folder.
+
+    Args:
+        folder_path: Path to the folder
+        args: Parsed command line arguments
+        use_local_whisper: Whether to use local Whisper model
+        whisper_model: Whisper model size
+        whisper_device: Device for local Whisper
+        enable_correction: Whether to enable GPT-4 correction
+        bulk_translator: Bulk translation method
+        fallback_chain: Fallback chain for translation
+    """
+    from src.transcribe_local import detect_language, get_model
+
+    # Find all video files
+    video_files = find_video_files(folder_path)
+
+    if not video_files:
+        logger.warning(f"No video files found in {folder_path}")
+        return
+
+    logger.info(f"Found {len(video_files)} video file(s) in {folder_path}")
+
+    # Filter out files with existing SRT if requested
+    if args.skip_existing:
+        original_count = len(video_files)
+        video_files = [v for v in video_files if not has_existing_srt(v)]
+        skipped_existing = original_count - len(video_files)
+        if skipped_existing > 0:
+            logger.info(f"Skipping {skipped_existing} video(s) with existing .srt files")
+    else:
+        skipped_existing = 0
+
+    if not video_files:
+        logger.info("No videos to process (all have existing subtitles)")
+        return
+
+    # Pre-load the Whisper model for language detection
+    logger.info("Loading Whisper model for language detection...")
+    get_model(whisper_model, whisper_device)
+
+    # Tracking statistics
+    processed = 0
+    skipped_language = 0
+    failed = 0
+    skipped_files = []
+
+    total = len(video_files)
+
+    for idx, video_path in enumerate(video_files, 1):
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"[{idx}/{total}] Checking: {video_path.name}")
+        logger.info("=" * 60)
+
+        try:
+            # Extract audio for language detection
+            audio_path = extract_audio(video_path)
+
+            # Detect language
+            detected_lang, confidence = detect_language(
+                audio_path,
+                model_size=whisper_model,
+                device=whisper_device
+            )
+
+            if detected_lang != "ja":
+                logger.info(f"Skipping (not Japanese): detected {detected_lang} ({confidence:.1%} confidence)")
+                skipped_language += 1
+                skipped_files.append((video_path.name, detected_lang, confidence))
+                cleanup_files(audio_path)
+                continue
+
+            logger.info(f"Language: Japanese ({confidence:.1%} confidence) - proceeding with transcription")
+
+            # Clean up audio from detection (will be re-extracted in process_single_video)
+            cleanup_files(audio_path)
+
+            # Process the video
+            success = process_single_video(
+                video_path,
+                args,
+                use_local_whisper,
+                whisper_model,
+                whisper_device,
+                enable_correction,
+                bulk_translator,
+                fallback_chain
+            )
+
+            if success:
+                processed += 1
+            else:
+                failed += 1
+
+        except KeyboardInterrupt:
+            logger.info("\n\nProcess interrupted by user")
+            logger.info(f"Processed {processed} video(s) before interruption")
+            raise
+
+        except Exception as e:
+            logger.error(f"Error processing {video_path}: {e}")
+            failed += 1
+
+    # Print summary
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("Folder Processing Complete")
+    logger.info("=" * 60)
+    logger.info(f"Total files found: {total + skipped_existing}")
+    logger.info(f"  - Processed successfully: {processed}")
+    logger.info(f"  - Skipped (not Japanese): {skipped_language}")
+    logger.info(f"  - Skipped (SRT exists): {skipped_existing}")
+    logger.info(f"  - Failed: {failed}")
+
+    if skipped_files:
+        logger.info("")
+        logger.info("Files skipped due to language:")
+        for name, lang, conf in skipped_files:
+            logger.info(f"  - {name}: {lang} ({conf:.1%})")
+
+    logger.info("=" * 60)
 
 
 def main():
@@ -26,16 +285,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py test_file.mp4
-  python main.py input_videos/myvideo.mp4
+  python main.py test_file.mp4                    # Process single video
+  python main.py /path/to/videos/                 # Process all videos in folder
+  python main.py /path/to/videos/ --skip-existing # Skip videos with existing .srt
   python main.py "/path/with spaces/video.mp4"
         """
     )
 
     parser.add_argument(
-        "video_path",
+        "input_path",
         type=str,
-        help="Path to the video file (supports absolute and relative paths)"
+        help="Path to a video file or folder containing videos (supports absolute and relative paths)"
     )
 
     parser.add_argument(
@@ -119,24 +379,34 @@ Examples:
         help="Skip Japanese language detection check before transcription. Only used with --local-whisper."
     )
 
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip videos that already have .srt subtitle files (only applies to folder processing)"
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
     try:
-        # Validate video path
+        # Validate input path (can be file or directory)
         logger.info("=" * 60)
         logger.info("Whisper Subtitle Generator")
         logger.info("=" * 60)
 
-        video_path = validate_video_path(args.video_path)
-        logger.info(f"Input video: {video_path}")
+        input_path, is_directory = validate_input_path(args.input_path)
 
         # Determine local whisper settings
         use_local_whisper = args.local_whisper
         whisper_model = args.model if args.model else LOCAL_WHISPER_MODEL
         whisper_device = args.device if args.device else LOCAL_WHISPER_DEVICE
 
-        # Check if OpenAI API key is required
+        # Folder processing requires local whisper for language detection
+        if is_directory and not use_local_whisper:
+            logger.info("Folder mode: enabling local Whisper for language detection")
+            use_local_whisper = True
+
+        # Check if OpenAI API key is required (for translation, not transcription in local mode)
         if not use_local_whisper and not OPENAI_API_KEY:
             logger.error("OPENAI_API_KEY not found. Use --local-whisper for offline transcription or set the API key in .env")
             sys.exit(1)
@@ -162,110 +432,38 @@ Examples:
         # Determine fallback chain (CLI overrides config)
         fallback_chain = args.fallback_chain.split(',') if args.fallback_chain else FALLBACK_CHAIN
 
-        # Determine total steps
-        if args.direct_whisper or (use_local_whisper and args.direct_whisper):
-            # Direct whisper: extract + translate = 2 steps
-            total_steps = 2
-        elif use_local_whisper:
-            # Local whisper: extract + transcribe + translate (+ optional correction)
-            # No chunking step needed for local whisper
-            total_steps = 4 if enable_correction else 3
+        if is_directory:
+            # Process folder
+            logger.info(f"Input folder: {input_path}")
+            process_folder(
+                input_path,
+                args,
+                use_local_whisper,
+                whisper_model,
+                whisper_device,
+                enable_correction,
+                bulk_translator,
+                fallback_chain
+            )
         else:
-            # Normal mode: extract + transcribe + translate (+ optional correction)
-            total_steps = 4 if enable_correction else 3
-
-        # Check for cached Japanese subtitles (skip transcription if found)
-        # Skip cache entirely when using direct whisper (no Japanese intermediate)
-        segments = None
-        if not args.force_transcribe and not args.direct_whisper:
-            segments = load_japanese_srt(video_path)
-
-        if segments:
-            logger.info("Using cached Japanese subtitles (skip transcription)")
-            logger.info("Use --force-transcribe to re-transcribe from audio")
-        else:
-            # Step 1: Extract audio
-            logger.info(f"\n[1/{total_steps}] Extracting audio...")
-            audio_path = extract_audio(video_path)
-
-            # Step 2: Transcription/translation
-            if use_local_whisper:
-                # Local Whisper transcription (no chunking needed)
-                from src.transcribe_local import (
-                    transcribe_audio_local,
-                    transcribe_audio_local_translate,
-                    LanguageDetectionError
-                )
-
-                if args.direct_whisper:
-                    # Direct translation to English
-                    logger.info(f"\n[2/{total_steps}] Transcribing and translating with local Whisper ({whisper_model})...")
-                    segments, _ = transcribe_audio_local_translate(
-                        audio_path,
-                        model_size=whisper_model,
-                        device=whisper_device,
-                        beam_size=args.beam_size,
-                        skip_language_check=args.skip_language_check
-                    )
-                else:
-                    # Transcribe to Japanese first
-                    logger.info(f"\n[2/{total_steps}] Transcribing with local Whisper ({whisper_model})...")
-                    segments, _ = transcribe_audio_local(
-                        audio_path,
-                        model_size=whisper_model,
-                        device=whisper_device,
-                        beam_size=args.beam_size,
-                        skip_language_check=args.skip_language_check
-                    )
-                chunks_info = None  # No chunks to clean up
-            elif args.direct_whisper:
-                # Direct Whisper API translation (no GPT-4 needed)
-                logger.info(f"\n[2/{total_steps}] Chunking and translating to English with Whisper API (concurrent processing)...")
-                chunks_generator = chunk_audio(audio_path)
-                segments, chunks_info = transcribe_audio_translate(chunks_generator, workers=args.workers)
-            else:
-                # Normal API mode: Transcribe to Japanese first
-                logger.info(f"\n[2/{total_steps}] Chunking and transcribing audio (concurrent processing)...")
-                chunks_generator = chunk_audio(audio_path)
-                segments, chunks_info = transcribe_audio(chunks_generator, workers=args.workers)
-
-            # Clean up chunk files (if any)
-            if chunks_info:
-                cleanup_chunks(chunks_info)
-
-            # Check if we got any segments
-            if not segments:
-                logger.error("No transcription segments were generated. Cannot create subtitle file.")
+            # Process single video
+            logger.info(f"Input video: {input_path}")
+            success = process_single_video(
+                input_path,
+                args,
+                use_local_whisper,
+                whisper_model,
+                whisper_device,
+                enable_correction,
+                bulk_translator,
+                fallback_chain
+            )
+            if not success:
                 sys.exit(1)
 
-            # Save Japanese subtitles for future use (only in normal mode)
-            if not args.direct_whisper:
-                save_japanese_srt(segments, video_path)
-
-            # Clean up extracted audio file
-            cleanup_files(audio_path)
-
-        # Step 3: Translate to English (skip if using direct Whisper)
-        if not args.direct_whisper:
-            translator_name = bulk_translator.upper()
-            logger.info(f"\n[3/{total_steps}] Translating to English with {translator_name}...")
-            logger.info(f"Fallback chain: {' → '.join(fallback_chain)}")
-            segments = translate_segments(segments, bulk_translator=bulk_translator, fallback_chain=fallback_chain)
-
-        # Step 4 (optional): Correct translations (only in normal mode)
-        if enable_correction and not args.direct_whisper:
-            logger.info(f"\n[4/{total_steps}] Correcting translations with GPT-4...")
-            segments = correct_translations(segments)
-
-        # Final step: Save subtitles
-        logger.info(f"\n[{total_steps}/{total_steps}] Generating subtitle file...")
-        srt_path = save_subtitles(segments, video_path)
-
-        # Success!
-        logger.info("\n" + "=" * 60)
-        logger.info("SUCCESS! Subtitle file created:")
-        logger.info(f"  {srt_path}")
-        logger.info("=" * 60)
+            logger.info("\n" + "=" * 60)
+            logger.info("Processing complete!")
+            logger.info("=" * 60)
 
     except KeyboardInterrupt:
         logger.info("\n\nProcess interrupted by user")

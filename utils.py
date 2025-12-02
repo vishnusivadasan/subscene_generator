@@ -5,6 +5,10 @@ Utility functions for the Whisper Subtitle Generator.
 import os
 import logging
 from pathlib import Path
+from typing import List, Tuple
+
+# Supported video file extensions
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v'}
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +38,78 @@ def validate_video_path(video_path: str) -> Path:
     if not path.is_file():
         raise ValueError(f"Path is not a file: {video_path}")
     return path
+
+
+def validate_input_path(input_path: str) -> Tuple[Path, bool]:
+    """
+    Validate input path - can be file or directory.
+
+    Args:
+        input_path: Path to a video file or directory
+
+    Returns:
+        Tuple of (resolved_path, is_directory)
+
+    Raises:
+        FileNotFoundError: If path doesn't exist
+    """
+    path = Path(input_path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Path not found: {input_path}")
+    return path, path.is_dir()
+
+
+def is_video_file(path: Path) -> bool:
+    """
+    Check if a file has a supported video extension.
+
+    Args:
+        path: Path to check
+
+    Returns:
+        True if file has a supported video extension
+    """
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def find_video_files(directory: Path, recursive: bool = True) -> List[Path]:
+    """
+    Find all video files in a directory.
+
+    Args:
+        directory: Directory to search
+        recursive: If True, search subdirectories recursively
+
+    Returns:
+        Sorted list of video file paths
+    """
+    video_files = []
+    if recursive:
+        for ext in VIDEO_EXTENSIONS:
+            video_files.extend(directory.rglob(f"*{ext}"))
+            # Also match uppercase extensions
+            video_files.extend(directory.rglob(f"*{ext.upper()}"))
+    else:
+        for ext in VIDEO_EXTENSIONS:
+            video_files.extend(directory.glob(f"*{ext}"))
+            video_files.extend(directory.glob(f"*{ext.upper()}"))
+
+    # Remove duplicates and sort
+    return sorted(set(video_files))
+
+
+def has_existing_srt(video_path: Path) -> bool:
+    """
+    Check if an SRT file already exists for this video.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        True if .srt file exists alongside the video
+    """
+    srt_path = video_path.with_suffix('.srt')
+    return srt_path.exists()
 
 
 def ensure_directory(directory: str) -> Path:
