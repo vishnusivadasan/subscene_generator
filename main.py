@@ -25,7 +25,8 @@ def process_single_video(
     whisper_device: str,
     enable_correction: bool,
     bulk_translator: str,
-    fallback_chain: list
+    fallback_chain: list,
+    source_language: str = None
 ) -> bool:
     """
     Process a single video file to generate subtitles.
@@ -39,6 +40,7 @@ def process_single_video(
         enable_correction: Whether to enable GPT-4 correction
         bulk_translator: Bulk translation method
         fallback_chain: Fallback chain for translation
+        source_language: Detected source language code (e.g., 'ja', 'zh', 'ko'). If None, will auto-detect.
 
     Returns:
         True on success, False on failure
@@ -54,13 +56,13 @@ def process_single_video(
         else:
             total_steps = 4 if enable_correction else 3
 
-        # Check for cached Japanese subtitles
+        # Check for cached source subtitles
         segments = None
         if not args.force_transcribe and not args.direct_whisper:
-            segments = load_japanese_srt(video_path)
+            segments = load_japanese_srt(video_path)  # TODO: rename to load_source_srt
 
         if segments:
-            logger.info("Using cached Japanese subtitles (skip transcription)")
+            logger.info("Using cached source subtitles (skip transcription)")
         else:
             # Step 1: Extract audio
             logger.info(f"\n[1/{total_steps}] Extracting audio...")
@@ -81,16 +83,20 @@ def process_single_video(
                         model_size=whisper_model,
                         device=whisper_device,
                         beam_size=args.beam_size,
-                        skip_language_check=args.skip_language_check
+                        skip_language_check=True if source_language else args.skip_language_check,
+                        expected_language=source_language if source_language else "ja"
                     )
                 else:
                     logger.info(f"\n[2/{total_steps}] Transcribing with local Whisper ({whisper_model})...")
+                    # Use detected language if provided, otherwise let it auto-detect
+                    transcribe_lang = source_language if source_language else "ja"
                     segments, _ = transcribe_audio_local(
                         audio_path,
                         model_size=whisper_model,
                         device=whisper_device,
+                        language=transcribe_lang,
                         beam_size=args.beam_size,
-                        skip_language_check=args.skip_language_check
+                        skip_language_check=True if source_language else args.skip_language_check
                     )
                 chunks_info = None
             elif args.direct_whisper:
@@ -218,19 +224,19 @@ def process_folder(
                 device=whisper_device
             )
 
-            if detected_lang != "ja":
-                logger.info(f"Skipping (not Japanese): detected {detected_lang} ({confidence:.1%} confidence)")
+            if detected_lang == "en":
+                logger.info(f"Skipping (already English): detected {detected_lang} ({confidence:.1%} confidence)")
                 skipped_language += 1
                 skipped_files.append((video_path.name, detected_lang, confidence))
                 cleanup_files(audio_path)
                 continue
 
-            logger.info(f"Language: Japanese ({confidence:.1%} confidence) - proceeding with transcription")
+            logger.info(f"Language: {detected_lang} ({confidence:.1%} confidence) - proceeding with transcription")
 
             # Clean up audio from detection (will be re-extracted in process_single_video)
             cleanup_files(audio_path)
 
-            # Process the video
+            # Process the video with detected language
             success = process_single_video(
                 video_path,
                 args,
@@ -239,7 +245,8 @@ def process_folder(
                 whisper_device,
                 enable_correction,
                 bulk_translator,
-                fallback_chain
+                fallback_chain,
+                source_language=detected_lang
             )
 
             if success:
@@ -263,7 +270,7 @@ def process_folder(
     logger.info("=" * 60)
     logger.info(f"Total files found: {total + skipped_existing}")
     logger.info(f"  - Processed successfully: {processed}")
-    logger.info(f"  - Skipped (not Japanese): {skipped_language}")
+    logger.info(f"  - Skipped (already English): {skipped_language}")
     logger.info(f"  - Skipped (SRT exists): {skipped_existing}")
     logger.info(f"  - Failed: {failed}")
 
