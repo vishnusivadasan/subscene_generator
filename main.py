@@ -9,7 +9,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from utils import validate_video_path, validate_input_path, find_video_files, has_existing_srt, logger, cleanup_files
+from utils import (
+    validate_video_path, validate_input_path, find_video_files, has_existing_srt,
+    logger, cleanup_files, load_metadata, save_metadata, create_metadata,
+    update_metadata_processed
+)
 from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
 from src.transcribe import transcribe_audio, transcribe_audio_translate, translate_segments, correct_translations
@@ -195,17 +199,23 @@ def process_folder(
         logger.info("No videos to process (all have existing subtitles)")
         return
 
-    # Pre-load the Whisper model for language detection
-    logger.info("Loading Whisper model for language detection...")
-    get_model(whisper_model, whisper_device)
+    # Build settings dict for metadata
+    settings = {
+        "whisper_model": whisper_model,
+        "bulk_translator": bulk_translator,
+        "with_correction": enable_correction,
+        "direct_whisper": args.direct_whisper
+    }
 
     # Tracking statistics
     processed = 0
     skipped_language = 0
+    skipped_metadata = 0
     failed = 0
     skipped_files = []
 
     total = len(video_files)
+    model_loaded = False
 
     for idx, video_path in enumerate(video_files, 1):
         logger.info("")
@@ -214,27 +224,60 @@ def process_folder(
         logger.info("=" * 60)
 
         try:
-            # Extract audio for language detection
-            audio_path = extract_audio(video_path)
+            # Check existing metadata first
+            metadata = load_metadata(video_path)
 
-            # Detect language
-            detected_lang, confidence = detect_language(
-                audio_path,
-                model_size=whisper_model,
-                device=whisper_device
-            )
+            if metadata:
+                # Check if already English (skip without re-detecting)
+                if metadata.get("detected_language") == "en":
+                    logger.info(f"Skipping (metadata: already English)")
+                    skipped_language += 1
+                    skipped_files.append((video_path.name, "en", metadata.get("language_confidence", 0)))
+                    continue
 
-            if detected_lang == "en":
-                logger.info(f"Skipping (already English): detected {detected_lang} ({confidence:.1%} confidence)")
-                skipped_language += 1
-                skipped_files.append((video_path.name, detected_lang, confidence))
+                # Check if already processed and SRT exists
+                if metadata.get("processed") and has_existing_srt(video_path):
+                    logger.info(f"Skipping (metadata: already processed)")
+                    skipped_metadata += 1
+                    continue
+
+                # Have metadata but not processed - use cached language info
+                detected_lang = metadata.get("detected_language")
+                confidence = metadata.get("language_confidence", 0)
+                logger.info(f"Using cached language: {detected_lang} ({confidence:.1%} confidence)")
+
+            else:
+                # No metadata - need to detect language
+                # Load model only when needed
+                if not model_loaded:
+                    logger.info("Loading Whisper model for language detection...")
+                    get_model(whisper_model, whisper_device)
+                    model_loaded = True
+
+                # Extract audio for language detection
+                audio_path = extract_audio(video_path)
+
+                # Detect language
+                detected_lang, confidence = detect_language(
+                    audio_path,
+                    model_size=whisper_model,
+                    device=whisper_device
+                )
+
+                # Clean up audio from detection
                 cleanup_files(audio_path)
-                continue
+
+                # Save metadata with detected language
+                metadata = create_metadata(video_path, detected_lang, confidence, settings)
+                save_metadata(video_path, metadata)
+
+                if detected_lang == "en":
+                    logger.info(f"Skipping (already English): detected {detected_lang} ({confidence:.1%} confidence)")
+                    skipped_language += 1
+                    skipped_files.append((video_path.name, detected_lang, confidence))
+                    continue
 
             logger.info(f"Language: {detected_lang} ({confidence:.1%} confidence) - proceeding with transcription")
-
-            # Clean up audio from detection (will be re-extracted in process_single_video)
-            cleanup_files(audio_path)
 
             # Process the video with detected language
             success = process_single_video(
@@ -251,6 +294,8 @@ def process_folder(
 
             if success:
                 processed += 1
+                # Update metadata to mark as processed
+                update_metadata_processed(video_path, video_path.with_suffix('.srt').name)
             else:
                 failed += 1
 
@@ -271,7 +316,8 @@ def process_folder(
     logger.info(f"Total files found: {total + skipped_existing}")
     logger.info(f"  - Processed successfully: {processed}")
     logger.info(f"  - Skipped (already English): {skipped_language}")
-    logger.info(f"  - Skipped (SRT exists): {skipped_existing}")
+    logger.info(f"  - Skipped (already processed): {skipped_metadata}")
+    logger.info(f"  - Skipped (SRT exists, --skip-existing): {skipped_existing}")
     logger.info(f"  - Failed: {failed}")
 
     if skipped_files:
