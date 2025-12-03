@@ -30,7 +30,8 @@ def process_single_video(
     enable_correction: bool,
     bulk_translator: str,
     fallback_chain: list,
-    source_language: str = None
+    source_language: str = None,
+    pre_extracted_audio: str = None
 ) -> bool:
     """
     Process a single video file to generate subtitles.
@@ -45,6 +46,7 @@ def process_single_video(
         bulk_translator: Bulk translation method
         fallback_chain: Fallback chain for translation
         source_language: Detected source language code (e.g., 'ja', 'zh', 'ko'). If None, will auto-detect.
+        pre_extracted_audio: Path to pre-extracted audio file (from prefetch). If None, will extract.
 
     Returns:
         True on success, False on failure
@@ -68,9 +70,13 @@ def process_single_video(
         if segments:
             logger.info("Using cached source subtitles (skip transcription)")
         else:
-            # Step 1: Extract audio
-            logger.info(f"\n[1/{total_steps}] Extracting audio...")
-            audio_path = extract_audio(video_path)
+            # Step 1: Extract audio (skip if pre-extracted)
+            if pre_extracted_audio:
+                logger.info(f"\n[1/{total_steps}] Using pre-extracted audio...")
+                audio_path = pre_extracted_audio
+            else:
+                logger.info(f"\n[1/{total_steps}] Extracting audio...")
+                audio_path = extract_audio(video_path)
 
             # Step 2: Transcription/translation
             if use_local_whisper:
@@ -151,6 +157,79 @@ def process_single_video(
         return False
 
 
+def prepare_video(
+    video_path: Path,
+    whisper_model: str,
+    whisper_device: str,
+    settings: dict,
+    detect_language_func,
+    get_model_func
+) -> tuple:
+    """
+    Prepare a video for processing (can run in background thread).
+
+    Checks metadata, extracts audio, and detects language.
+
+    Args:
+        video_path: Path to the video file
+        whisper_model: Whisper model size for language detection
+        whisper_device: Device for Whisper model
+        settings: Settings dict for metadata
+        detect_language_func: Language detection function
+        get_model_func: Model loading function
+
+    Returns:
+        Tuple of (video_path, detected_lang, confidence, audio_path, skip_reason)
+        - skip_reason is None if video should be processed
+        - skip_reason is "english" if video is in English
+        - skip_reason is "processed" if already processed
+        - audio_path is None if skipped or if using cached metadata
+    """
+    try:
+        # Check existing metadata first
+        metadata = load_metadata(video_path)
+
+        if metadata:
+            # Check if already English (skip without re-detecting)
+            if metadata.get("detected_language") == "en":
+                return (video_path, "en", metadata.get("language_confidence", 0), None, "english")
+
+            # Check if already processed and SRT exists
+            if metadata.get("processed") and has_existing_srt(video_path):
+                return (video_path, None, 0, None, "processed")
+
+            # Have metadata but not processed - use cached language info
+            detected_lang = metadata.get("detected_language")
+            confidence = metadata.get("language_confidence", 0)
+            return (video_path, detected_lang, confidence, None, None)
+
+        # No metadata - need to detect language
+        # Extract audio for language detection
+        audio_path = extract_audio(video_path)
+
+        # Detect language
+        detected_lang, confidence = detect_language_func(
+            audio_path,
+            model_size=whisper_model,
+            device=whisper_device
+        )
+
+        # Create and save metadata
+        new_metadata = create_metadata(video_path, detected_lang, confidence, settings)
+        save_metadata(video_path, new_metadata)
+
+        if detected_lang == "en":
+            cleanup_files(audio_path)
+            return (video_path, "en", confidence, None, "english")
+
+        # Return with audio path for processing
+        return (video_path, detected_lang, confidence, audio_path, None)
+
+    except Exception as e:
+        logger.error(f"Error preparing {video_path.name}: {e}")
+        return (video_path, None, 0, None, f"error: {e}")
+
+
 def process_folder(
     folder_path: Path,
     args,
@@ -215,98 +294,154 @@ def process_folder(
     skipped_files = []
 
     total = len(video_files)
-    model_loaded = False
 
-    for idx, video_path in enumerate(video_files, 1):
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info(f"[{idx}/{total}] Checking: {video_path.name}")
-        logger.info("=" * 60)
+    # Pre-load Whisper model for language detection (needed for prefetch threads)
+    logger.info("Loading Whisper model for language detection...")
+    get_model(whisper_model, whisper_device)
 
-        try:
-            # Check existing metadata first
-            metadata = load_metadata(video_path)
+    # Check if prefetch is enabled
+    use_prefetch = not getattr(args, 'no_prefetch', False) and total > 1
 
-            if metadata:
-                # Check if already English (skip without re-detecting)
-                if metadata.get("detected_language") == "en":
-                    logger.info(f"Skipping (metadata: already English)")
-                    skipped_language += 1
-                    skipped_files.append((video_path.name, "en", metadata.get("language_confidence", 0)))
-                    continue
+    if use_prefetch:
+        from concurrent.futures import ThreadPoolExecutor
+        logger.info("Pipeline mode: prefetching next video while processing")
 
-                # Check if already processed and SRT exists
-                if metadata.get("processed") and has_existing_srt(video_path):
-                    logger.info(f"Skipping (metadata: already processed)")
-                    skipped_metadata += 1
-                    continue
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Submit first video for preparation
+            pending_future = executor.submit(
+                prepare_video, video_files[0], whisper_model, whisper_device,
+                settings, detect_language, get_model
+            )
 
-                # Have metadata but not processed - use cached language info
-                detected_lang = metadata.get("detected_language")
-                confidence = metadata.get("language_confidence", 0)
-                logger.info(f"Using cached language: {detected_lang} ({confidence:.1%} confidence)")
+            for idx, video_path in enumerate(video_files):
+                logger.info("")
+                logger.info("=" * 60)
+                logger.info(f"[{idx + 1}/{total}] Processing: {video_path.name}")
+                logger.info("=" * 60)
 
-            else:
-                # No metadata - need to detect language
-                # Load model only when needed
-                if not model_loaded:
-                    logger.info("Loading Whisper model for language detection...")
-                    get_model(whisper_model, whisper_device)
-                    model_loaded = True
+                try:
+                    # Get preparation result for current video
+                    prep_result = pending_future.result()
+                    _, detected_lang, confidence, audio_path, skip_reason = prep_result
 
-                # Extract audio for language detection
-                audio_path = extract_audio(video_path)
+                    # Submit NEXT video for preparation (if exists)
+                    if idx + 1 < len(video_files):
+                        pending_future = executor.submit(
+                            prepare_video, video_files[idx + 1], whisper_model, whisper_device,
+                            settings, detect_language, get_model
+                        )
 
-                # Detect language
-                detected_lang, confidence = detect_language(
-                    audio_path,
-                    model_size=whisper_model,
-                    device=whisper_device
+                    # Handle skip reasons
+                    if skip_reason == "english":
+                        logger.info(f"Skipping (already English): {detected_lang} ({confidence:.1%} confidence)")
+                        skipped_language += 1
+                        skipped_files.append((video_path.name, detected_lang, confidence))
+                        continue
+                    elif skip_reason == "processed":
+                        logger.info(f"Skipping (metadata: already processed)")
+                        skipped_metadata += 1
+                        continue
+                    elif skip_reason and skip_reason.startswith("error:"):
+                        logger.error(f"Preparation failed: {skip_reason}")
+                        failed += 1
+                        continue
+
+                    logger.info(f"Language: {detected_lang} ({confidence:.1%} confidence) - proceeding with transcription")
+
+                    # Process the video with detected language and pre-extracted audio
+                    success = process_single_video(
+                        video_path,
+                        args,
+                        use_local_whisper,
+                        whisper_model,
+                        whisper_device,
+                        enable_correction,
+                        bulk_translator,
+                        fallback_chain,
+                        source_language=detected_lang,
+                        pre_extracted_audio=audio_path
+                    )
+
+                    if success:
+                        processed += 1
+                        update_metadata_processed(video_path, video_path.with_suffix('.srt').name)
+                    else:
+                        failed += 1
+                        # Clean up audio if processing failed
+                        if audio_path:
+                            cleanup_files(audio_path)
+
+                except KeyboardInterrupt:
+                    logger.info("\n\nProcess interrupted by user")
+                    logger.info(f"Processed {processed} video(s) before interruption")
+                    raise
+
+                except Exception as e:
+                    logger.error(f"Error processing {video_path}: {e}")
+                    failed += 1
+
+    else:
+        # Sequential processing (no prefetch)
+        for idx, video_path in enumerate(video_files, 1):
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info(f"[{idx}/{total}] Processing: {video_path.name}")
+            logger.info("=" * 60)
+
+            try:
+                # Prepare video (synchronous)
+                _, detected_lang, confidence, audio_path, skip_reason = prepare_video(
+                    video_path, whisper_model, whisper_device,
+                    settings, detect_language, get_model
                 )
 
-                # Clean up audio from detection
-                cleanup_files(audio_path)
-
-                # Save metadata with detected language
-                metadata = create_metadata(video_path, detected_lang, confidence, settings)
-                save_metadata(video_path, metadata)
-
-                if detected_lang == "en":
-                    logger.info(f"Skipping (already English): detected {detected_lang} ({confidence:.1%} confidence)")
+                # Handle skip reasons
+                if skip_reason == "english":
+                    logger.info(f"Skipping (already English): {detected_lang} ({confidence:.1%} confidence)")
                     skipped_language += 1
                     skipped_files.append((video_path.name, detected_lang, confidence))
                     continue
+                elif skip_reason == "processed":
+                    logger.info(f"Skipping (metadata: already processed)")
+                    skipped_metadata += 1
+                    continue
+                elif skip_reason and skip_reason.startswith("error:"):
+                    logger.error(f"Preparation failed: {skip_reason}")
+                    failed += 1
+                    continue
 
-            logger.info(f"Language: {detected_lang} ({confidence:.1%} confidence) - proceeding with transcription")
+                logger.info(f"Language: {detected_lang} ({confidence:.1%} confidence) - proceeding with transcription")
 
-            # Process the video with detected language
-            success = process_single_video(
-                video_path,
-                args,
-                use_local_whisper,
-                whisper_model,
-                whisper_device,
-                enable_correction,
-                bulk_translator,
-                fallback_chain,
-                source_language=detected_lang
-            )
+                # Process the video
+                success = process_single_video(
+                    video_path,
+                    args,
+                    use_local_whisper,
+                    whisper_model,
+                    whisper_device,
+                    enable_correction,
+                    bulk_translator,
+                    fallback_chain,
+                    source_language=detected_lang,
+                    pre_extracted_audio=audio_path
+                )
 
-            if success:
-                processed += 1
-                # Update metadata to mark as processed
-                update_metadata_processed(video_path, video_path.with_suffix('.srt').name)
-            else:
+                if success:
+                    processed += 1
+                    update_metadata_processed(video_path, video_path.with_suffix('.srt').name)
+                else:
+                    failed += 1
+                    if audio_path:
+                        cleanup_files(audio_path)
+
+            except KeyboardInterrupt:
+                logger.info("\n\nProcess interrupted by user")
+                logger.info(f"Processed {processed} video(s) before interruption")
+                raise
+
+            except Exception as e:
+                logger.error(f"Error processing {video_path}: {e}")
                 failed += 1
-
-        except KeyboardInterrupt:
-            logger.info("\n\nProcess interrupted by user")
-            logger.info(f"Processed {processed} video(s) before interruption")
-            raise
-
-        except Exception as e:
-            logger.error(f"Error processing {video_path}: {e}")
-            failed += 1
 
     # Print summary
     logger.info("")
@@ -436,6 +571,12 @@ Examples:
         "--skip-existing",
         action="store_true",
         help="Skip videos that already have .srt subtitle files (only applies to folder processing)"
+    )
+
+    parser.add_argument(
+        "--no-prefetch",
+        action="store_true",
+        help="Disable background prefetching of next video (reduces memory usage, slower processing)"
     )
 
     # Parse arguments
