@@ -91,17 +91,90 @@ def find_video_files(directory: Path, recursive: bool = True) -> List[Path]:
     """
     video_files = []
     if recursive:
-        for ext in VIDEO_EXTENSIONS:
-            video_files.extend(directory.rglob(f"*{ext}"))
-            # Also match uppercase extensions
-            video_files.extend(directory.rglob(f"*{ext.upper()}"))
+        # Single pass through all files, filter by extension in Python
+        for path in directory.rglob("*"):
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                video_files.append(path)
     else:
-        for ext in VIDEO_EXTENSIONS:
-            video_files.extend(directory.glob(f"*{ext}"))
-            video_files.extend(directory.glob(f"*{ext.upper()}"))
+        for path in directory.iterdir():
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                video_files.append(path)
 
-    # Remove duplicates and sort
-    return sorted(set(video_files))
+    return sorted(video_files)
+
+
+def scan_video_folder(directory: Path, recursive: bool = True) -> dict:
+    """
+    Scan a directory once and collect all video files, SRT files, and metadata.
+
+    This is optimized for network filesystems - does a single directory traversal
+    instead of multiple glob operations and individual file existence checks.
+
+    Args:
+        directory: Directory to search
+        recursive: If True, search subdirectories recursively
+
+    Returns:
+        Dict with:
+        - videos: List of video file paths
+        - srt_set: Set of video stems that have .srt files
+        - metadata: Dict mapping video path -> loaded metadata (or None)
+    """
+    video_files = []
+    srt_stems = set()  # Store stems of files that have SRTs
+    metadata_files = {}  # Map video base name -> metadata file path
+
+    # Single pass through all files
+    iterator = directory.rglob("*") if recursive else directory.iterdir()
+
+    for path in iterator:
+        if not path.is_file():
+            continue
+
+        suffix_lower = path.suffix.lower()
+
+        # Collect video files
+        if suffix_lower in VIDEO_EXTENSIONS:
+            video_files.append(path)
+        # Track SRT files by their stem (filename without extension)
+        elif suffix_lower == '.srt':
+            srt_stems.add(path.stem)
+        # Track metadata files
+        elif path.name.endswith(METADATA_SUFFIX):
+            # Extract the video filename this metadata belongs to
+            # e.g., "video.mp4.subscene.json" -> "video.mp4"
+            video_name = path.name[:-len(METADATA_SUFFIX)]
+            metadata_files[video_name] = path
+
+    # Sort videos
+    video_files = sorted(video_files)
+
+    # Build set of video paths that have SRTs (for fast lookup)
+    # A video "foo.mp4" has an SRT if "foo" is in srt_stems
+    srt_set = set()
+    for video_path in video_files:
+        if video_path.stem in srt_stems:
+            srt_set.add(video_path)
+
+    # Load metadata for each video (reading files is unavoidable, but we know which exist)
+    metadata = {}
+    for video_path in video_files:
+        meta_path = metadata_files.get(video_path.name)
+        if meta_path:
+            try:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    metadata[video_path] = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Failed to load metadata for {video_path.name}: {e}")
+                metadata[video_path] = None
+        else:
+            metadata[video_path] = None
+
+    return {
+        'videos': video_files,
+        'srt_set': srt_set,
+        'metadata': metadata
+    }
 
 
 def has_existing_srt(video_path: Path) -> bool:

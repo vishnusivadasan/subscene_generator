@@ -12,8 +12,8 @@ from pathlib import Path
 
 from utils import (
     validate_video_path, validate_input_path, find_video_files, has_existing_srt,
-    logger, cleanup_files, load_metadata, save_metadata, create_metadata,
-    update_metadata_processed
+    scan_video_folder, logger, cleanup_files, load_metadata, save_metadata,
+    create_metadata, update_metadata_processed
 )
 from src.extract_audio import extract_audio
 from src.chunk_audio import chunk_audio, cleanup_chunks
@@ -244,6 +244,54 @@ def prepare_video(
         return (video_path, None, 0, None, f"error: {e}")
 
 
+def prescan_videos(video_files: list, metadata_cache: dict, srt_set: set) -> dict:
+    """
+    Categorize video files using pre-loaded metadata (no filesystem calls).
+
+    Args:
+        video_files: List of video file paths
+        metadata_cache: Dict mapping video_path -> metadata dict (from scan_video_folder)
+        srt_set: Set of video paths that have SRT files (from scan_video_folder)
+
+    Returns:
+        Dict with categorized lists:
+        - to_process: Files that need processing
+        - skip_error: Files with previous errors
+        - skip_english: Files already in English
+        - skip_processed: Files already processed with SRT
+    """
+    result = {
+        'to_process': [],
+        'skip_error': [],
+        'skip_english': [],
+        'skip_processed': []
+    }
+
+    for video_path in video_files:
+        metadata = metadata_cache.get(video_path)
+
+        if metadata:
+            # Check if previously failed with error
+            if metadata.get("skip") or metadata.get("error"):
+                result['skip_error'].append(video_path)
+                continue
+
+            # Check if already English
+            if metadata.get("detected_language") == "en":
+                result['skip_english'].append(video_path)
+                continue
+
+            # Check if already processed and SRT exists
+            if metadata.get("processed") and video_path in srt_set:
+                result['skip_processed'].append(video_path)
+                continue
+
+        # No skip reason - add to process list
+        result['to_process'].append(video_path)
+
+    return result
+
+
 def process_folder(
     folder_path: Path,
     args,
@@ -269,19 +317,24 @@ def process_folder(
     """
     from src.transcribe_local import detect_language, get_model
 
-    # Find all video files
-    video_files = find_video_files(folder_path)
+    # Single scan to find all videos, SRTs, and metadata at once
+    # This is much faster on network filesystems than multiple separate calls
+    logger.info(f"Scanning folder: {folder_path}")
+    folder_scan = scan_video_folder(folder_path)
+    video_files = folder_scan['videos']
+    srt_set = folder_scan['srt_set']
+    metadata_cache = folder_scan['metadata']
 
     if not video_files:
         logger.warning(f"No video files found in {folder_path}")
         return
 
-    logger.info(f"Found {len(video_files)} video file(s) in {folder_path}")
+    logger.info(f"Found {len(video_files)} video file(s)")
 
-    # Filter out files with existing SRT if requested
+    # Filter out files with existing SRT if requested (using pre-scanned srt_set)
     if args.skip_existing:
         original_count = len(video_files)
-        video_files = [v for v in video_files if not has_existing_srt(v)]
+        video_files = [v for v in video_files if v not in srt_set]
         skipped_existing = original_count - len(video_files)
         if skipped_existing > 0:
             logger.info(f"Skipping {skipped_existing} video(s) with existing .srt files")
@@ -292,6 +345,37 @@ def process_folder(
         logger.info("No videos to process (all have existing subtitles)")
         return
 
+    # Categorize remaining files using pre-loaded metadata (no filesystem calls)
+    scan_result = prescan_videos(video_files, metadata_cache, srt_set)
+
+    # Display summary
+    logger.info("")
+    logger.info("File scan summary:")
+    logger.info(f"  To process: {len(scan_result['to_process'])}")
+    logger.info(f"  Skip (previous error): {len(scan_result['skip_error'])}")
+    logger.info(f"  Skip (already English): {len(scan_result['skip_english'])}")
+    logger.info(f"  Skip (already processed): {len(scan_result['skip_processed'])}")
+
+    # List skipped files
+    if scan_result['skip_error'] or scan_result['skip_english'] or scan_result['skip_processed']:
+        logger.info("")
+        logger.info("Skipped files:")
+        for video_path in scan_result['skip_error']:
+            logger.info(f"  [error] {video_path.name}")
+        for video_path in scan_result['skip_english']:
+            logger.info(f"  [english] {video_path.name}")
+        for video_path in scan_result['skip_processed']:
+            logger.info(f"  [processed] {video_path.name}")
+
+    # Early exit if nothing to process
+    if not scan_result['to_process']:
+        logger.info("")
+        logger.info("No videos to process")
+        return
+
+    # Update video_files to only those needing processing
+    video_files = scan_result['to_process']
+
     # Build settings dict for metadata
     settings = {
         "whisper_model": whisper_model,
@@ -300,7 +384,7 @@ def process_folder(
         "direct_whisper": args.direct_whisper
     }
 
-    # Tracking statistics
+    # Tracking statistics (for files that get skipped during processing, e.g. new files detected as English)
     processed = 0
     skipped_language = 0
     skipped_metadata = 0
@@ -311,6 +395,7 @@ def process_folder(
     total = len(video_files)
 
     # Pre-load Whisper model for language detection (needed for prefetch threads)
+    logger.info("")
     logger.info("Loading Whisper model for language detection...")
     get_model(whisper_model, whisper_device)
 
@@ -467,16 +552,20 @@ def process_folder(
                 failed += 1
 
     # Print summary
+    # Calculate total including pre-scanned skips
+    prescanned_skips = len(scan_result['skip_error']) + len(scan_result['skip_english']) + len(scan_result['skip_processed'])
+    total_found = total + skipped_existing + prescanned_skips
+
     logger.info("")
     logger.info("=" * 60)
     logger.info("Folder Processing Complete")
     logger.info("=" * 60)
-    logger.info(f"Total files found: {total + skipped_existing}")
+    logger.info(f"Total files found: {total_found}")
     logger.info(f"  - Processed successfully: {processed}")
-    logger.info(f"  - Skipped (already English): {skipped_language}")
-    logger.info(f"  - Skipped (already processed): {skipped_metadata}")
+    logger.info(f"  - Skipped (already English): {skipped_language + len(scan_result['skip_english'])}")
+    logger.info(f"  - Skipped (already processed): {skipped_metadata + len(scan_result['skip_processed'])}")
     logger.info(f"  - Skipped (SRT exists, --skip-existing): {skipped_existing}")
-    logger.info(f"  - Skipped (previous error): {skipped_error}")
+    logger.info(f"  - Skipped (previous error): {skipped_error + len(scan_result['skip_error'])}")
     logger.info(f"  - Failed: {failed}")
 
     if skipped_files:
