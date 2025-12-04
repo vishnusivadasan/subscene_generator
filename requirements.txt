@@ -1,5 +1,13 @@
+# Core dependencies
 python-dotenv>=1.0.0
 openai>=1.0.0
 tqdm>=4.66.0
 deep-translator>=1.11.4
 faster-whisper>=1.0.0
+
+# Optional: TUI mode (uncomment to enable)
+# textual>=0.47.0
+
+# Optional: GPU acceleration for faster-whisper
+# Uncomment for CUDA support (requires NVIDIA GPU + CUDA toolkit)
+# torch>=2.0.0
