@@ -7,6 +7,7 @@ Processes video files to generate English subtitle files using OpenAI Whisper AP
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from utils import (
@@ -190,6 +191,10 @@ def prepare_video(
         metadata = load_metadata(video_path)
 
         if metadata:
+            # Check if previously failed with error - skip
+            if metadata.get("skip") or metadata.get("error"):
+                return (video_path, None, 0, None, f"skipped: {metadata.get('error', 'marked to skip')}")
+
             # Check if already English (skip without re-detecting)
             if metadata.get("detected_language") == "en":
                 return (video_path, "en", metadata.get("language_confidence", 0), None, "english")
@@ -227,6 +232,15 @@ def prepare_video(
 
     except Exception as e:
         logger.error(f"Error preparing {video_path.name}: {e}")
+        # Save error to metadata so we skip this file next time
+        error_metadata = {
+            "version": 1,
+            "video_file": video_path.name,
+            "error": str(e),
+            "error_at": datetime.utcnow().isoformat() + "Z",
+            "skip": True
+        }
+        save_metadata(video_path, error_metadata)
         return (video_path, None, 0, None, f"error: {e}")
 
 
@@ -290,6 +304,7 @@ def process_folder(
     processed = 0
     skipped_language = 0
     skipped_metadata = 0
+    skipped_error = 0
     failed = 0
     skipped_files = []
 
@@ -344,6 +359,10 @@ def process_folder(
                     elif skip_reason and skip_reason.startswith("error:"):
                         logger.error(f"Preparation failed: {skip_reason}")
                         failed += 1
+                        continue
+                    elif skip_reason and skip_reason.startswith("skipped:"):
+                        logger.info(f"Skipping (previous error): {video_path.name}")
+                        skipped_error += 1
                         continue
 
                     logger.info(f"Language: {detected_lang} ({confidence:.1%} confidence) - proceeding with transcription")
@@ -409,6 +428,10 @@ def process_folder(
                     logger.error(f"Preparation failed: {skip_reason}")
                     failed += 1
                     continue
+                elif skip_reason and skip_reason.startswith("skipped:"):
+                    logger.info(f"Skipping (previous error): {video_path.name}")
+                    skipped_error += 1
+                    continue
 
                 logger.info(f"Language: {detected_lang} ({confidence:.1%} confidence) - proceeding with transcription")
 
@@ -453,6 +476,7 @@ def process_folder(
     logger.info(f"  - Skipped (already English): {skipped_language}")
     logger.info(f"  - Skipped (already processed): {skipped_metadata}")
     logger.info(f"  - Skipped (SRT exists, --skip-existing): {skipped_existing}")
+    logger.info(f"  - Skipped (previous error): {skipped_error}")
     logger.info(f"  - Failed: {failed}")
 
     if skipped_files:

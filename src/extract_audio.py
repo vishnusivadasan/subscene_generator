@@ -57,6 +57,23 @@ def extract_audio(video_path: Path) -> str:
             stderr=subprocess.PIPE,
             check=True
         )
+
+        # Check stderr for critical errors (ffmpeg may exit 0 despite corrupt audio)
+        stderr_output = result.stderr.decode() if result.stderr else ""
+        critical_errors = [
+            "Conversion failed",
+            "Error while filtering",
+            "Failed to inject frame into filter network",
+            "Rematrix is needed between",
+        ]
+        for error in critical_errors:
+            if error in stderr_output:
+                logger.error(f"ffmpeg extraction failed (corrupt audio): {error}")
+                # Clean up partial output file
+                if Path(output_path).exists():
+                    Path(output_path).unlink()
+                raise RuntimeError(f"Corrupt audio stream: {error}")
+
         logger.info(f"Audio extracted successfully: {output_path}")
         return output_path
 
