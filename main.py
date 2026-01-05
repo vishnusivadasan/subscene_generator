@@ -139,7 +139,7 @@ def process_single_video(
             translator_name = bulk_translator.upper()
             logger.info(f"\n[3/{total_steps}] Translating to English with {translator_name}...")
             logger.info(f"Fallback chain: {' → '.join(fallback_chain)}")
-            segments = translate_segments(segments, bulk_translator=bulk_translator, fallback_chain=fallback_chain)
+            segments = translate_segments(segments, workers=args.translation_workers, bulk_translator=bulk_translator, fallback_chain=fallback_chain)
 
         # Step 4 (optional): Correct translations
         if enable_correction and not args.direct_whisper:
@@ -604,6 +604,13 @@ Examples:
         type=int,
         default=None,
         help="Number of parallel workers for transcription only (default: from config or 4). Translation uses TRANSLATION_WORKERS from config."
+    )
+
+    parser.add_argument(
+        "--translation-workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers for translation (default: from config or 4). Overrides TRANSLATION_WORKERS from config."
     )
 
     parser.add_argument(

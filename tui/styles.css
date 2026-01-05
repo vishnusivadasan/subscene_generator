@@ -1,0 +1,60 @@
+/* Subscene Generator TUI Styles */
+
+Screen {
+    background: $surface;
+}
+
+#main_container {
+    layout: vertical;
+    height: 100%;
+    padding: 1;
+}
+
+#header {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#pipeline {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#current_step {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#workers {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#log_container {
+    height: 1fr;
+    min-height: 8;
+    margin-bottom: 1;
+    border: solid $primary;
+}
+
+#logs {
+    height: auto;
+}
+
+#stats {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#help {
+    height: 1;
+    content-align: center middle;
+}
+
+Header {
+    background: $boost;
+}
+
+Footer {
+    background: $panel;
+}
